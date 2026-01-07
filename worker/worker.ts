@@ -402,10 +402,20 @@ async function computeResponse(request: Request, colo: string | undefined, env: 
     if (protocol === 'http:' && env.origin?.startsWith('https:')) return computeHttpToHttpsRedirectResponse(request.url); // redirect http -> https for all non-episode-redirect requests
 
     // Proxy RSS feed requests to the backend API
-    // This allows rss.donecast.com/rss/{slug}/feed.xml to serve feeds
-    // while also handling /e/ tracking redirects on the same domain
-    if ((method === 'GET' || method === 'HEAD') && pathname.startsWith('/rss/')) {
-        const backendUrl = `https://api.donecast.com${pathname}${searchParams.toString() ? '?' + searchParams.toString() : ''}`;
+    // Supports two URL patterns:
+    // - Clean: rss.donecast.com/{slug}/feed.xml -> proxies to api.donecast.com/rss/{slug}/feed.xml
+    // - Legacy: rss.donecast.com/rss/{slug}/feed.xml -> proxies to api.donecast.com/rss/{slug}/feed.xml
+    const feedXmlMatch = pathname.match(/^\/([a-zA-Z0-9_-]+)\/feed\.xml$/);
+    const isLegacyRss = pathname.startsWith('/rss/');
+    const isFeedRequest = feedXmlMatch || isLegacyRss;
+
+    if ((method === 'GET' || method === 'HEAD') && isFeedRequest) {
+        // For clean URLs like /{slug}/feed.xml, rewrite to /rss/{slug}/feed.xml for backend
+        let backendPath = pathname;
+        if (feedXmlMatch && !isLegacyRss) {
+            backendPath = `/rss${pathname}`;
+        }
+        const backendUrl = `https://api.donecast.com${backendPath}${searchParams.toString() ? '?' + searchParams.toString() : ''}`;
         try {
             const backendResponse = await fetch(backendUrl, {
                 method,
@@ -426,6 +436,53 @@ async function computeResponse(request: Request, colo: string | undefined, env: 
         } catch (e) {
             consoleError('rss-proxy', `Error proxying RSS feed: ${(e as Error).stack || e}`);
             return new Response('Failed to fetch RSS feed', { status: 502 });
+        }
+    }
+
+    // Handle /media/ requests for episode audio
+    // URL pattern: /media/{user_id}/{podcast_id}/{episode_id}/episode.mp3
+    // This fetches the signed R2 URL from the backend and redirects through OP3 tracking
+    if ((method === 'GET' || method === 'HEAD') && pathname.startsWith('/media/')) {
+        // Extract episode path: /media/{user_id}/{podcast_id}/{episode_id}/episode.mp3
+        const mediaPath = pathname.substring(7); // Remove '/media/' prefix
+
+        // Fetch the signed URL from the backend
+        const backendUrl = `https://api.donecast.com/rss/media-url/${mediaPath}`;
+        try {
+            const backendResponse = await fetch(backendUrl, {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json',
+                    'User-Agent': headers.get('user-agent') ?? 'OP3-Media-Proxy/1.0',
+                },
+            });
+
+            if (!backendResponse.ok) {
+                return new Response('Media not found', { status: backendResponse.status });
+            }
+
+            const data = await backendResponse.json() as { url?: string };
+            const signedUrl = data?.url;
+
+            if (!signedUrl) {
+                return new Response('Media URL not found', { status: 404 });
+            }
+
+            // Redirect to the signed R2 URL
+            // Note: OP3 tracking is handled by the /e/ redirect path which this request
+            // already triggered (the enclosure URL in RSS is /e/rss.donecast.com/media/...)
+            // But for direct /media/ requests, we just redirect to the signed URL
+            return new Response(undefined, {
+                status: 302,
+                headers: {
+                    'cache-control': 'private, no-cache',
+                    'location': signedUrl,
+                    'access-control-allow-origin': '*',
+                },
+            });
+        } catch (e) {
+            consoleError('media-proxy', `Error fetching media URL: ${(e as Error).stack || e}`);
+            return new Response('Failed to fetch media', { status: 502 });
         }
     }
 

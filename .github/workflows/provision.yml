@@ -1,9 +1,9 @@
 name: Provision analytics resources
 
-# Probes CF_API_TOKEN scope and provisions the storage/ingestion backend
-# (R2 blobs bucket, KV namespace, queue1/queue2 + consumers) that the OP3
-# worker needs to actually RECORD downloads. Read-mostly + idempotent; does
-# NOT touch the live worker script. Safe to run repeatedly.
+# Probes CF_API_TOKEN scope, provisions the storage/ingestion backend
+# (R2 blobs bucket, KV namespace, queue1/queue2 + consumers) the OP3 worker
+# needs to RECORD downloads, and inspects the deployed worker's bindings.
+# Idempotent; does not touch the live worker script. Safe to run repeatedly.
 on:
   workflow_dispatch:
 
@@ -17,60 +17,38 @@ jobs:
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       SCRIPT_NAME: op3-donecast
-      BLOBS_BUCKET: op3-donecast-blobs
-      KV_TITLE: op3-donecast-kv
+      BLOBS_BUCKET: analytics-blobs
       QUEUE1_NAME: op3-donecast-queue1
       QUEUE2_NAME: op3-donecast-queue2
     steps:
-      - name: Probe + provision
+      - name: Probe + provision + inspect
         run: |
           set -uo pipefail
           A="$CF_ACCOUNT_ID"
           H_AUTH="Authorization: Bearer $CF_API_TOKEN"
           BASE="https://api.cloudflare.com/client/v4"
           api() { curl -s -X "$1" "$BASE$2" -H "$H_AUTH" -H "Content-Type: application/json" ${3:+-d "$3"}; }
-          ok() { python3 -c "import sys,json;d=json.load(sys.stdin);print('OK' if d.get('success') else 'ERR '+json.dumps(d.get('errors')))" ; }
 
-          echo "===== TOKEN VERIFY ====="
-          api GET "/user/tokens/verify" | ok
+          echo "===== ENSURE QUEUES EXIST ====="
+          for QN in "$QUEUE1_NAME" "$QUEUE2_NAME"; do
+            api POST "/accounts/$A/queues" "{\"queue_name\":\"$QN\"}" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);print('$QN','success=',d.get('success'),'errors=',d.get('errors'))"
+          done
 
-          echo "===== EXISTING R2 BUCKETS ====="
-          api GET "/accounts/$A/r2/buckets" | python3 -c "import sys,json;d=json.load(sys.stdin);print('success=',d.get('success'));[print(' -',b['name']) for b in (d.get('result') or {}).get('buckets',[])]" 2>/dev/null || echo "  (r2 list failed / no scope)"
-
-          echo "===== EXISTING QUEUES ====="
-          api GET "/accounts/$A/queues" | python3 -c "import sys,json;d=json.load(sys.stdin);print('success=',d.get('success'));[print(' -',q.get('queue_name'),q.get('queue_id')) for q in (d.get('result') or [])]" 2>/dev/null || echo "  (queues list failed / no scope)"
-
-          echo "===== EXISTING KV NAMESPACES ====="
-          api GET "/accounts/$A/storage/kv/namespaces?per_page=100" | python3 -c "import sys,json;d=json.load(sys.stdin);print('success=',d.get('success'));[print(' -',n.get('title'),n.get('id')) for n in (d.get('result') or [])]" 2>/dev/null || echo "  (kv list failed / no scope)"
-
-          echo "===== CREATE R2 BUCKET ($BLOBS_BUCKET) ====="
-          api POST "/accounts/$A/r2/buckets" "{\"name\":\"$BLOBS_BUCKET\"}" | ok
-
-          echo "===== CREATE KV NAMESPACE ($KV_TITLE) ====="
-          api POST "/accounts/$A/storage/kv/namespaces" "{\"title\":\"$KV_TITLE\"}" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);print('success=',d.get('success'),'id=',(d.get('result') or {}).get('id'),'errors=',d.get('errors'))"
-
-          echo "===== CREATE QUEUE1 ($QUEUE1_NAME) ====="
-          api POST "/accounts/$A/queues" "{\"queue_name\":\"$QUEUE1_NAME\"}" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);print('success=',d.get('success'),'id=',(d.get('result') or {}).get('queue_id'),'errors=',d.get('errors'))"
-
-          echo "===== CREATE QUEUE2 ($QUEUE2_NAME) ====="
-          api POST "/accounts/$A/queues" "{\"queue_name\":\"$QUEUE2_NAME\"}" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);print('success=',d.get('success'),'id=',(d.get('result') or {}).get('queue_id'),'errors=',d.get('errors'))"
-
-          echo "===== RESOLVE QUEUE IDS + WIRE CONSUMERS to $SCRIPT_NAME ====="
+          echo "===== WIRE CONSUMERS (queue -> $SCRIPT_NAME) ====="
           QJSON=$(api GET "/accounts/$A/queues")
           for QN in "$QUEUE1_NAME" "$QUEUE2_NAME"; do
             QID=$(echo "$QJSON" | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((q['queue_id'] for q in (d.get('result') or []) if q.get('queue_name')=='$QN'),''))")
-            echo "queue $QN -> id=$QID"
-            if [ -n "$QID" ]; then
-              api POST "/accounts/$A/queues/$QID/consumers" "{\"type\":\"worker\",\"script_name\":\"$SCRIPT_NAME\",\"settings\":{\"batch_size\":100,\"max_retries\":3,\"max_wait_time_ms\":5000}}" \
-                | python3 -c "import sys,json;d=json.load(sys.stdin);print('  consumer:','OK' if d.get('success') else d.get('errors'))"
-            fi
+            echo "queue $QN id=$QID"
+            echo "  existing consumers:"
+            api GET "/accounts/$A/queues/$QID/consumers" | python3 -c "import sys,json;d=json.load(sys.stdin);[print('   -',c.get('script') or c.get('script_name'),c.get('type')) for c in (d.get('result') or [])]"
+            api POST "/accounts/$A/queues/$QID/consumers" "{\"type\":\"worker\",\"script_name\":\"$SCRIPT_NAME\",\"settings\":{\"batch_size\":100,\"max_retries\":3,\"max_wait_time_ms\":5000}}" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);print('  add consumer:','OK' if d.get('success') else d.get('errors'))"
+            echo "  backlog/lag:"
+            api GET "/accounts/$A/queues/$QID" | python3 -c "import sys,json;d=json.load(sys.stdin);r=d.get('result') or {};print('   ',json.dumps(r.get('producers_total_count','?')),'producers; consumers:',len(r.get('consumers') or []),'; backlog:',(r.get('backlog') if 'backlog' in r else r.get('queue_id')))" 2>/dev/null || echo "   (n/a)"
           done
 
-          echo "===== SUMMARY (copy these into deploy bindings) ====="
-          echo "BLOBS_BUCKET=$BLOBS_BUCKET"
-          echo "QUEUE1_NAME=$QUEUE1_NAME"
-          echo "QUEUE2_NAME=$QUEUE2_NAME"
-          api GET "/accounts/$A/storage/kv/namespaces?per_page=100" | python3 -c "import sys,json;d=json.load(sys.stdin);print('KV_NAMESPACE='+next((n['id'] for n in (d.get('result') or []) if n.get('title')=='$KV_TITLE'),'<none>'))"
+          echo "===== DEPLOYED WORKER BINDINGS ($SCRIPT_NAME) ====="
+          api GET "/accounts/$A/workers/scripts/$SCRIPT_NAME/settings" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);r=d.get('result') or {};[print(' -',b.get('type'),b.get('name'),b.get('queue_name') or b.get('bucket_name') or b.get('namespace_id') or '') for b in (r.get('bindings') or [])]" 2>/dev/null \
+            || api GET "/accounts/$A/workers/scripts/$SCRIPT_NAME/settings" | head -c 500

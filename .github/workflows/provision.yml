@@ -7,59 +7,59 @@ permissions:
   contents: read
 
 jobs:
-  tail:
+  diag:
     runs-on: ubuntu-22.04
     env:
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       SCRIPT_NAME: op3-donecast
+      KV_NS: 8d26dc68be8547548d65620c991d1c7f
       EP: media.donecast.com/b6d5f77e-699e-444b-a31a-e1b4cb15feb4/d369f2ea-acef-48af-aa74-192cc9cdab0f/41a46f72-07a5-4033-8e41-064e1d7911f2/episode.mp3
     steps:
-      - name: Tail worker while firing hits
+      - name: Seed KV key, inspect keys, tail full
         run: |
           set -uo pipefail
           pip install -q websockets
-          A="$CF_ACCOUNT_ID"
-          # create tail session
-          TAIL=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$A/workers/scripts/$SCRIPT_NAME/tails" -H "Authorization: Bearer $CF_API_TOKEN")
-          echo "tail create: $(echo "$TAIL" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("success=",d.get("success"),"errors=",d.get("errors"))')"
-          URL=$(echo "$TAIL" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("result") or {}).get("url",""))')
-          echo "tail url host: $(echo "$URL" | sed -E 's#(wss://[^/]+).*#\1#')"
-          [ -z "$URL" ] && { echo "no tail url"; exit 0; }
+          A="$CF_ACCOUNT_ID"; H="Authorization: Bearer $CF_API_TOKEN"; B="https://api.cloudflare.com/client/v4"
 
+          echo "===== seed redirects-hmac-2026-06 in KV (if missing) ====="
+          MONTHKEY=$(python3 -c "import secrets;print(secrets.token_hex(64))")
+          EXIST=$(curl -s "$B/accounts/$A/storage/kv/namespaces/$KV_NS/values/redirects-hmac-2026-06" -H "$H")
+          if echo "$EXIST" | grep -qE '^[0-9a-f]{128}$'; then echo "already present"; else
+            curl -s -X PUT "$B/accounts/$A/storage/kv/namespaces/$KV_NS/values/redirects-hmac-2026-06" -H "$H" --data "$MONTHKEY" \
+              | python3 -c "import sys,json;d=json.load(sys.stdin);print('put:',d.get('success'),d.get('errors'))"
+          fi
+
+          echo "===== keyServer DO keys (admin /keys) ====="
+          curl -s "$B/../../../dev/null" >/dev/null 2>&1 || true
+          curl -s "https://analytics.donecast.com/api/1/keys?token=optional" | head -c 500; echo
+
+          echo "===== tail (full raw) while firing hits ====="
+          URL=$(curl -s -X POST "$B/accounts/$A/workers/scripts/$SCRIPT_NAME/tails" -H "$H" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("result") or {}).get("url",""))')
           python3 - "$URL" <<'PY' &
           import asyncio,sys,json,websockets
           async def main():
-              url=sys.argv[1]
-              async with websockets.connect(url, subprotocols=["trace-v1"], open_timeout=20) as ws:
-                  print("TAIL CONNECTED", flush=True)
+              async with websockets.connect(sys.argv[1], subprotocols=["trace-v1"], open_timeout=20) as ws:
+                  print("CONNECTED",flush=True)
                   try:
                       while True:
-                          msg=await asyncio.wait_for(ws.recv(), timeout=30)
-                          try:
-                              d=json.loads(msg)
-                              logs=d.get("logs",[]); exc=d.get("exceptions",[])
-                              ev=d.get("event",{})
-                              req=(ev.get("request") or {}).get("url") if isinstance(ev,dict) else None
-                              out=(ev.get("queue") or {}).get("queue") if isinstance(ev,dict) else None
-                              print("EVENT", d.get("outcome"), "req=",req, "queue=",out, flush=True)
-                              for l in logs: print("  LOG", l.get("level"), str(l.get("message"))[:400], flush=True)
-                              for e in exc: print("  EXC", e.get("name"), str(e.get("message"))[:400], flush=True)
-                          except Exception as pe:
-                              print("RAW", str(msg)[:300], flush=True)
-                  except asyncio.TimeoutError:
-                      print("TAIL IDLE TIMEOUT", flush=True)
+                          msg=await asyncio.wait_for(ws.recv(),timeout=35)
+                          d=json.loads(msg)
+                          ev=d.get("event") or {}
+                          kind = "queue" if "batchSize" in ev else ("do" if d.get("entrypoint") or "alarm" in str(ev) else "fetch")
+                          print(f"--EVENT outcome={d.get('outcome')} type={kind} script={d.get('scriptName')} ver={(d.get('scriptVersion') or {}).get('id','')[:8]}",flush=True)
+                          for e in d.get("exceptions",[]): print("   EXC",e.get("name"),str(e.get("message"))[:500],flush=True)
+                          for l in d.get("logs",[]):
+                              m=str(l.get("message"))
+                              if "rawRedirect" not in m: print("   LOG",l.get("level"),m[:500],flush=True)
+                  except asyncio.TimeoutError: print("IDLE",flush=True)
           asyncio.run(main())
           PY
-          TAILPID=$!
-          sleep 6
-          echo "=== firing hits ==="
-          for n in 1 2 3 4 5 6; do
-            curl -s -o /dev/null -w "analytics %{http_code}\n" -A "TailTest$n" "https://analytics.donecast.com/e/$EP"
-            curl -s -o /dev/null -w "rss %{http_code}\n" -A "TailTest$n" "https://rss.donecast.com/e/$EP"
-          done
-          echo "=== waiting for tail events (queue consumer fires ~5s after send) ==="
-          sleep 30
-          kill $TAILPID 2>/dev/null || true
-          wait $TAILPID 2>/dev/null || true
-          echo "=== done ==="
+          TP=$!; sleep 6
+          for n in 1 2 3 4 5 6 7 8; do curl -s -o /dev/null "https://analytics.donecast.com/e/$EP" -A "DiagB$n"; done
+          echo "hits fired; waiting for consumer+DO..."
+          sleep 30; kill $TP 2>/dev/null||true; wait $TP 2>/dev/null||true
+
+          echo "===== post-test: show-download-counts + hitc ====="
+          curl -s "https://analytics.donecast.com/api/1/queries/show-download-counts?showUuid=a525e200d35543caa80ec4c4c65e29f4&token=optional" | head -c 300; echo
+          curl -s "https://analytics.donecast.com/api/1/admin/metrics?token=optional" | grep -E "minutes_count|known_server" || true

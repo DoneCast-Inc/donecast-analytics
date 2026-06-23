@@ -1,9 +1,5 @@
 name: Provision analytics resources
 
-# Probes CF_API_TOKEN scope, provisions the storage/ingestion backend
-# (R2 blobs bucket, KV namespace, queue1/queue2 + consumers) the OP3 worker
-# needs to RECORD downloads, and inspects the deployed worker's bindings.
-# Idempotent; does not touch the live worker script. Safe to run repeatedly.
 on:
   workflow_dispatch:
 
@@ -17,38 +13,15 @@ jobs:
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       SCRIPT_NAME: op3-donecast
-      BLOBS_BUCKET: analytics-blobs
-      QUEUE1_NAME: op3-donecast-queue1
-      QUEUE2_NAME: op3-donecast-queue2
     steps:
-      - name: Probe + provision + inspect
+      - name: Queue stats + consumer detail
         run: |
           set -uo pipefail
-          A="$CF_ACCOUNT_ID"
-          H_AUTH="Authorization: Bearer $CF_API_TOKEN"
-          BASE="https://api.cloudflare.com/client/v4"
-          api() { curl -s -X "$1" "$BASE$2" -H "$H_AUTH" -H "Content-Type: application/json" ${3:+-d "$3"}; }
-
-          echo "===== ENSURE QUEUES EXIST ====="
-          for QN in "$QUEUE1_NAME" "$QUEUE2_NAME"; do
-            api POST "/accounts/$A/queues" "{\"queue_name\":\"$QN\"}" \
-              | python3 -c "import sys,json;d=json.load(sys.stdin);print('$QN','success=',d.get('success'),'errors=',d.get('errors'))"
-          done
-
-          echo "===== WIRE CONSUMERS (queue -> $SCRIPT_NAME) ====="
+          A="$CF_ACCOUNT_ID"; H_AUTH="Authorization: Bearer $CF_API_TOKEN"; BASE="https://api.cloudflare.com/client/v4"
+          api() { curl -s -X "$1" "$BASE$2" -H "$H_AUTH" -H "Content-Type: application/json"; }
           QJSON=$(api GET "/accounts/$A/queues")
-          for QN in "$QUEUE1_NAME" "$QUEUE2_NAME"; do
+          for QN in op3-donecast-queue1 op3-donecast-queue2; do
             QID=$(echo "$QJSON" | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((q['queue_id'] for q in (d.get('result') or []) if q.get('queue_name')=='$QN'),''))")
-            echo "queue $QN id=$QID"
-            echo "  existing consumers:"
-            api GET "/accounts/$A/queues/$QID/consumers" | python3 -c "import sys,json;d=json.load(sys.stdin);[print('   -',c.get('script') or c.get('script_name'),c.get('type')) for c in (d.get('result') or [])]"
-            api POST "/accounts/$A/queues/$QID/consumers" "{\"type\":\"worker\",\"script_name\":\"$SCRIPT_NAME\",\"settings\":{\"batch_size\":100,\"max_retries\":3,\"max_wait_time_ms\":5000}}" \
-              | python3 -c "import sys,json;d=json.load(sys.stdin);print('  add consumer:','OK' if d.get('success') else d.get('errors'))"
-            echo "  backlog/lag:"
-            api GET "/accounts/$A/queues/$QID" | python3 -c "import sys,json;d=json.load(sys.stdin);r=d.get('result') or {};print('   ',json.dumps(r.get('producers_total_count','?')),'producers; consumers:',len(r.get('consumers') or []),'; backlog:',(r.get('backlog') if 'backlog' in r else r.get('queue_id')))" 2>/dev/null || echo "   (n/a)"
+            echo "===== $QN ($QID) full object ====="
+            api GET "/accounts/$A/queues/$QID" | python3 -m json.tool
           done
-
-          echo "===== DEPLOYED WORKER BINDINGS ($SCRIPT_NAME) ====="
-          api GET "/accounts/$A/workers/scripts/$SCRIPT_NAME/settings" \
-            | python3 -c "import sys,json;d=json.load(sys.stdin);r=d.get('result') or {};[print(' -',b.get('type'),b.get('name'),b.get('queue_name') or b.get('bucket_name') or b.get('namespace_id') or '') for b in (r.get('bindings') or [])]" 2>/dev/null \
-            || api GET "/accounts/$A/workers/scripts/$SCRIPT_NAME/settings" | head -c 500

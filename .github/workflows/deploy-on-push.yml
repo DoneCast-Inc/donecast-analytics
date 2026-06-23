@@ -30,4 +30,11 @@ jobs:
           INSTANCE: prod
           ADMIN_TOKENS: ${{ secrets.ADMIN_TOKENS || 'optional' }}
           PREVIEW_TOKENS: ${{ secrets.PREVIEW_TOKENS || 'optional' }}
+          # Storage + ingestion backend. Without these the worker redirects but
+          # never RECORDS a download: HitsController/ShowController throw without
+          # blobsBucket, and the recording path is skipped when queue2 is unbound.
+          BLOBS_BUCKET: analytics-blobs
+          KV_NAMESPACE: 8d26dc68be8547548d65620c991d1c7f
+          QUEUE1_NAME: op3-donecast-queue1
+          QUEUE2_NAME: op3-donecast-queue2
 

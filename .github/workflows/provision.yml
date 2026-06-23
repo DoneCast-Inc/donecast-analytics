@@ -5,7 +5,6 @@ name: Provision analytics resources
 # worker needs to actually RECORD downloads. Read-mostly + idempotent; does
 # NOT touch the live worker script. Safe to run repeatedly.
 on:
-  push:
   workflow_dispatch:
 
 permissions:

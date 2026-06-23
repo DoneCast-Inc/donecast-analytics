@@ -191,9 +191,11 @@ export class BackendDO {
                             const { results, message } = await getOrLoadHitsController().adminExecuteDataQuery(obj);
                             return newRpcResponse({ kind: 'admin-data', results, message });
                         } else if (targetPath.startsWith('/hls/') && durableObjectName === DoNames.hlsServer) {
-                            const { results, message } = await getOrLoadHlsController().adminExecuteDataQuery(obj);
+                            const res = await getOrLoadHlsController().adminExecuteDataQuery(obj);
+                            if (res instanceof Response) return res; // disallowed admin query -> 403, pass through
+                            const { results, message } = res;
                             return newRpcResponse({ kind: 'admin-data', results, message });
-                        } 
+                        }
 
                         const csddr = tryParseComputeShowDailyDownloadsRequest({ operationKind, targetPath, parameters });
                         if (csddr) {

@@ -7,21 +7,59 @@ permissions:
   contents: read
 
 jobs:
-  provision:
+  tail:
     runs-on: ubuntu-22.04
     env:
       CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       SCRIPT_NAME: op3-donecast
+      EP: media.donecast.com/b6d5f77e-699e-444b-a31a-e1b4cb15feb4/d369f2ea-acef-48af-aa74-192cc9cdab0f/41a46f72-07a5-4033-8e41-064e1d7911f2/episode.mp3
     steps:
-      - name: Queue stats + consumer detail
+      - name: Tail worker while firing hits
         run: |
           set -uo pipefail
-          A="$CF_ACCOUNT_ID"; H_AUTH="Authorization: Bearer $CF_API_TOKEN"; BASE="https://api.cloudflare.com/client/v4"
-          api() { curl -s -X "$1" "$BASE$2" -H "$H_AUTH" -H "Content-Type: application/json"; }
-          QJSON=$(api GET "/accounts/$A/queues")
-          for QN in op3-donecast-queue1 op3-donecast-queue2; do
-            QID=$(echo "$QJSON" | python3 -c "import sys,json;d=json.load(sys.stdin);print(next((q['queue_id'] for q in (d.get('result') or []) if q.get('queue_name')=='$QN'),''))")
-            echo "===== $QN ($QID) full object ====="
-            api GET "/accounts/$A/queues/$QID" | python3 -m json.tool
+          pip install -q websockets
+          A="$CF_ACCOUNT_ID"
+          # create tail session
+          TAIL=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$A/workers/scripts/$SCRIPT_NAME/tails" -H "Authorization: Bearer $CF_API_TOKEN")
+          echo "tail create: $(echo "$TAIL" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("success=",d.get("success"),"errors=",d.get("errors"))')"
+          URL=$(echo "$TAIL" | python3 -c 'import sys,json;print((json.load(sys.stdin).get("result") or {}).get("url",""))')
+          echo "tail url host: $(echo "$URL" | sed -E 's#(wss://[^/]+).*#\1#')"
+          [ -z "$URL" ] && { echo "no tail url"; exit 0; }
+
+          python3 - "$URL" <<'PY' &
+          import asyncio,sys,json,websockets
+          async def main():
+              url=sys.argv[1]
+              async with websockets.connect(url, subprotocols=["trace-v1"], open_timeout=20) as ws:
+                  print("TAIL CONNECTED", flush=True)
+                  try:
+                      while True:
+                          msg=await asyncio.wait_for(ws.recv(), timeout=30)
+                          try:
+                              d=json.loads(msg)
+                              logs=d.get("logs",[]); exc=d.get("exceptions",[])
+                              ev=d.get("event",{})
+                              req=(ev.get("request") or {}).get("url") if isinstance(ev,dict) else None
+                              out=(ev.get("queue") or {}).get("queue") if isinstance(ev,dict) else None
+                              print("EVENT", d.get("outcome"), "req=",req, "queue=",out, flush=True)
+                              for l in logs: print("  LOG", l.get("level"), str(l.get("message"))[:400], flush=True)
+                              for e in exc: print("  EXC", e.get("name"), str(e.get("message"))[:400], flush=True)
+                          except Exception as pe:
+                              print("RAW", str(msg)[:300], flush=True)
+                  except asyncio.TimeoutError:
+                      print("TAIL IDLE TIMEOUT", flush=True)
+          asyncio.run(main())
+          PY
+          TAILPID=$!
+          sleep 6
+          echo "=== firing hits ==="
+          for n in 1 2 3 4 5 6; do
+            curl -s -o /dev/null -w "analytics %{http_code}\n" -A "TailTest$n" "https://analytics.donecast.com/e/$EP"
+            curl -s -o /dev/null -w "rss %{http_code}\n" -A "TailTest$n" "https://rss.donecast.com/e/$EP"
           done
+          echo "=== waiting for tail events (queue consumer fires ~5s after send) ==="
+          sleep 30
+          kill $TAILPID 2>/dev/null || true
+          wait $TAILPID 2>/dev/null || true
+          echo "=== done ==="

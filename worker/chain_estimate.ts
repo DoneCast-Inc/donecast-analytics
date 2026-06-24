@@ -26,6 +26,18 @@ export function computeChainEstimate(url: string): ChainEstimate {
         return [ { kind: 'prefix', prefix: 'op3', url }, ...computeChainEstimate(targetUrl) ];
     }
 
+    // self-hosted OP3 (donecast): https://(rss|analytics).donecast.com/e(,args)?/(https?://)?
+    // same redirect prefix as op3.dev, served on the donecast hostnames — must be
+    // recognized here or downloads never canonicalize to their media.donecast.com
+    // destination and can't be attributed to shows/episodes.
+    m = /^https?:\/\/(rss|analytics)\.donecast\.com(:443|:80)?\/e(,.*?|\/pg=[^/]+)?\/\/?(.+?)$/.exec(url);
+    if (m) {
+        const [ _, _subdomain, _port, _args, suffix ] = m;
+        m = /^((https?):\/\/?).*?$/i.exec(suffix);
+        const targetUrl = m ? `${m[2].toLowerCase()}://${suffix.substring(m[1].length)}` : `https://${suffix}`;
+        return [ { kind: 'prefix', prefix: 'op3', url }, ...computeChainEstimate(targetUrl) ];
+    }
+
     // https://dts.podtrac.com/redirect.mp3/
     // https://www.podtrac.com/pts/redirect.mp3/
     // https://dts.podtrac.com/pts/redirect.mp3/

@@ -20,6 +20,7 @@ import { computeShowStatsObj, lookupShowId } from './api_shows.ts';
 import { computeAppDownloads, computeRelativeSummary, insertZeros, RelativeSummary } from './api_shared.ts';
 import { DoNames } from '../do_names.ts';
 import { EpisodeRecord, ShowRecord } from '../backend/show_controller_model.ts';
+import { METROS } from '../../app/metros.ts';
 
 type Opts = { name: string, method: string, searchParams: URLSearchParams, miscBlobs?: Blobs, roMiscBlobs?: Blobs, rpcClient: RpcClient, roRpcClient?: RpcClient, configuration: Configuration, statsBlobs?: Blobs, roStatsBlobs?: Blobs };
 
@@ -145,6 +146,62 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         const countryDownloads = Object.fromEntries(sortBy(Object.entries(countryDownloadsAcc), v => -v[1]));
         const queryTime = Date.now() - start;
         return newJsonResponse({ showUuid: showUuidInput, countryDownloads, queryTime, ...(debug ? { times } : {}) });
+    }
+
+    if (name === 'top-dimension-for-show') {
+        // Generic reader for any dimension show_summaries.processForShow already rolls
+        // up per month (deviceType/deviceName/browserName/metroCode/referrer, etc.).
+        // Same monthly-summary source as top-apps/top-countries — just parameterized.
+        const targetStatsBlobs = searchParams.has('ro') ? roStatsBlobs : statsBlobs;
+        if (!targetStatsBlobs) throw new Error(`Need statsBlobs`);
+
+        const ALLOWED_DIMENSIONS = new Set([ 'deviceType', 'deviceName', 'browserName', 'metroCode', 'referrer', 'appName', 'libraryName' ]);
+        const { showUuid: showUuidParam, podcastGuid, feedUrlBase64, dimension } = Object.fromEntries(searchParams);
+        if (typeof dimension !== 'string' || !ALLOWED_DIMENSIONS.has(dimension)) {
+            return newJsonResponse({ error: `Bad 'dimension': ${dimension}. Allowed: ${[ ...ALLOWED_DIMENSIONS ].join(', ')}` }, 400);
+        }
+        let showUuidOrPodcastGuidOrFeedUrlBase64 = '';
+        try {
+            if (typeof showUuidParam === 'string') {
+                if (!isValidUuid(showUuidParam)) throw new Error(`Bad showUuid: ${showUuidParam}`);
+                showUuidOrPodcastGuidOrFeedUrlBase64 = showUuidParam;
+            } else if (typeof podcastGuid === 'string') {
+                if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(podcastGuid)) throw new Error(`Bad podcastGuid: ${podcastGuid}`);
+                showUuidOrPodcastGuidOrFeedUrlBase64 = podcastGuid;
+            } else if (typeof feedUrlBase64 === 'string') {
+                if (!/^[0-9a-zA-Z_-]{15,}=*$/i.test(feedUrlBase64) || !isValidFeedUrlBase64(feedUrlBase64)) throw new Error(`Bad feedUrlBase64: ${feedUrlBase64}`);
+                showUuidOrPodcastGuidOrFeedUrlBase64 = feedUrlBase64;
+            }
+        } catch (e) {
+            const { message } = packError(e);
+            return newJsonResponse({ message }, 400);
+        }
+        const times: Record<string, number> = {};
+        const lookupResult = await lookupShowId({ showUuidOrPodcastGuidOrFeedUrlBase64, searchParams, rpcClient, roRpcClient, configuration, times });
+        if (lookupResult instanceof Response) return lookupResult;
+        const { showUuid, showUuidInput } = lookupResult;
+
+        const thisMonth = new Date().toISOString().substring(0, 7);
+        const latestThreeMonths = [ -2, -1, 0 ].map(v => addMonthsToMonthString(thisMonth, v));
+        const latestThreeMonthSummaries = await timed(times, 'get-3mo-summary', async () => (await Promise.all(latestThreeMonths.map(v => targetStatsBlobs.get(computeShowSummaryKey({ showUuid, period: v }), 'json')))).filter(isValidShowSummary));
+
+        const downloadsAcc: Record<string, number> = {};
+        for (const summary of latestThreeMonthSummaries) {
+            incrementAll(downloadsAcc, (summary.dimensionDownloads ?? {})[dimension] ?? {});
+        }
+        // metroCode is a numeric DMA code — relabel to human city names so the
+        // breakdown is readable (falls back to the raw code if unmapped).
+        const relabel = dimension === 'metroCode'
+            ? (k: string) => METROS[k] ?? k
+            : (k: string) => k;
+        const merged: Record<string, number> = {};
+        for (const [ k, v ] of Object.entries(downloadsAcc)) {
+            const name = relabel(k);
+            merged[name] = (merged[name] ?? 0) + v;
+        }
+        const downloads = Object.fromEntries(sortBy(Object.entries(merged), v => -v[1]));
+        const queryTime = Date.now() - start;
+        return newJsonResponse({ showUuid: showUuidInput, dimension, downloads, queryTime, ...(debug ? { times } : {}) });
     }
 
     if (name === 'show-daily-downloads') {

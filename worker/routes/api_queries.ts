@@ -147,6 +147,33 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         return newJsonResponse({ showUuid: showUuidInput, countryDownloads, queryTime, ...(debug ? { times } : {}) });
     }
 
+    if (name === 'show-daily-downloads') {
+        // Single source of truth for every show-level download window AND the
+        // downloads-over-time chart: the live per-hour download totals
+        // (computeShowStatsObj.hourlyDownloads, the same data episode-download-counts
+        // is built from), summed into UTC calendar days. The backend derives 7d/30d/
+        // 365d/all-time/chart all from this one map, so the numbers can never disagree.
+        const { showUuid } = Object.fromEntries(searchParams);
+        if (typeof showUuid !== 'string' || !isValidUuid(showUuid)) return newJsonResponse({ error: `Bad 'showUuid': ${showUuid}` }, 400);
+
+        const searchParamsInput = new URLSearchParams({ listens: 'stub', audience: 'stub' });
+        if (searchParams.has('ro')) searchParamsInput.set('ro', 'true');
+
+        const times: Record<string, number> = {};
+        const showStatsObj = await timed(times, 'compute-stats', () => computeShowStatsObj({ configuration, method: 'GET', searchParams: searchParamsInput, showUuid, roStatsBlobs, statsBlobs, times }));
+
+        const { hourlyDownloads } = showStatsObj;
+        const dailyDownloads: Record<string, number> = {};
+        for (const [ hr, count ] of Object.entries(hourlyDownloads ?? {})) {
+            const day = hr.substring(0, 10); // 'YYYY-MM-DDTHH' -> 'YYYY-MM-DD'
+            dailyDownloads[day] = (dailyDownloads[day] ?? 0) + count;
+        }
+        const sortedDaily = Object.fromEntries(sortBy(Object.entries(dailyDownloads), v => v[0])); // ascending in time
+
+        const queryTime = Date.now() - start;
+        return newJsonResponse({ showUuid, dailyDownloads: sortedDaily, queryTime, ...(debug ? { times } : {}) });
+    }
+
     if (name === 'top-apps') {
         const times: Record<string, number> = {};
 

@@ -1,6 +1,14 @@
 
 export function hasOp3Reference(url: string): boolean {
-    return typeof url === 'string' && url.toLowerCase().includes('op3.dev/e');
+    if (typeof url !== 'string') return false;
+    const lower = url.toLowerCase();
+    // self-hosted OP3 (donecast): the same /e redirect prefix as op3.dev, but served on
+    // rss/analytics.donecast.com. computeRelevantUrls() gates entirely on this function, so
+    // without recognizing these hosts feed items get empty relevantUrls, the match-url index
+    // stays empty, and downloads can never be attributed to shows/episodes. Mirror of the
+    // donecast prefix handling in chain_estimate.ts (computeChainEstimate).
+    return lower.includes('op3.dev/e')
+        || /(?:rss|analytics)\.donecast\.com(?::\d+)?\/e[,/]/.test(lower);
 }
 
 export async function hasOp3InRedirectChain(url: string, { userAgent }: { userAgent: string }): Promise<boolean | undefined> {

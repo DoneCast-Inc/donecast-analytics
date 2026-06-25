@@ -1,0 +1,102 @@
+name: Daily downloads rollup
+
+# Computes per-show / per-episode download counts for the previous UTC day and
+# refreshes the rolling monthly summaries. This is the self-hosted equivalent of
+# the rollup pipeline op3.dev runs on its private backend.
+#
+# Validated sequence (per UTC day, via /api/1/admin/data):
+#   0. refresh every feed (update-feed-and-index-items) so new episodes get
+#      feed-item + match-url index records, then rebuild the match-url indexes.
+#      Without this, downloads for newly-published episodes can't be attributed.
+#   a. hourly hitsBlobs rollup for each hour HH
+#   b. show-columns  (the attribution step: maps hits -> show/episode via match-url)
+#   c. daily         (shows=exclude= == all shows)
+#   d. compute-show-daily-downloads
+#   e. recompute-show-summaries for each show (month = yesterday's YYYY-MM)
+#
+# Requires repo secret OP3_ADMIN_TOKEN (the /admin/data token).
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 03:00 UTC daily — well after the prior UTC day closes
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'UTC date to roll up (YYYY-MM-DD). Defaults to yesterday.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  rollup:
+    runs-on: ubuntu-22.04
+    env:
+      API: https://analytics.donecast.com/api/1/admin/data
+      TOKEN: ${{ secrets.OP3_ADMIN_TOKEN }}
+    steps:
+      - name: Run rollup
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN}" ]; then echo "::error::OP3_ADMIN_TOKEN secret is not set"; exit 1; fi
+
+          DATE="${{ github.event.inputs.date }}"
+          if [ -z "${DATE}" ]; then DATE="$(date -u -d 'yesterday' +%F)"; fi
+          MONTH="${DATE:0:7}"
+          echo "Rolling up ${DATE} (month ${MONTH})"
+
+          call() {  # $1 = json body -> prints response body, fails on http error
+            curl -sS --fail-with-body -m 240 -X POST "${API}?token=${TOKEN}" \
+              -H 'Content-Type: application/json' -d "$1"
+          }
+
+          echo "::group::0. refresh feeds + rebuild match-url indexes"
+          FEEDS_JSON="$(call '{"operationKind":"select","targetPath":"/show/feeds"}')"
+          # feed record ids (sha256 hex) for every known feed
+          FEED_IDS="$(echo "${FEEDS_JSON}" | jq -r '.results[].id')"
+          # distinct show uuids attached to feeds (for per-show summary recompute)
+          SHOW_UUIDS="$(echo "${FEEDS_JSON}" | jq -r '.results[].showUuid | select(. != null)' | sort -u)"
+          for FID in ${FEED_IDS}; do
+            echo "  feed ${FID}"
+            call "{\"operationKind\":\"update\",\"targetPath\":\"/show/feeds/${FID}\",\"parameters\":{\"action\":\"update-feed-and-index-items\"}}" \
+              | jq -c '.message // .' || true
+          done
+          echo "  rebuild match-url"
+          call '{"operationKind":"update","targetPath":"/show/index/match-url","parameters":{"go":"true"}}' | jq -c '.results // .'
+          echo "  rebuild queryless-match-url"
+          call '{"operationKind":"update","targetPath":"/show/index/queryless-match-url","parameters":{"go":"true"}}' | jq -c '.results // .'
+          echo "::endgroup::"
+
+          echo "::group::a. hourly hitsBlobs"
+          for H in $(seq -w 0 23); do
+            call "{\"operationKind\":\"update\",\"targetPath\":\"/show/stats\",\"parameters\":{\"hour\":\"${DATE}T${H}\",\"target\":\"hitsBlobs\",\"maxHits\":\"5000\",\"maxQueries\":\"200\",\"querySize\":\"1000\"}}" \
+              | jq -c '{hour:.hour,hits:.hits,downloads:.downloads}' || true
+          done
+          echo "::endgroup::"
+
+          echo "::group::b. show-columns (attribution)"
+          call "{\"operationKind\":\"update\",\"targetPath\":\"/show/stats\",\"parameters\":{\"date\":\"${DATE}\",\"type\":\"show-columns\"}}" \
+            | jq -c '.results[0] | {date:.date,rows:.rows,downloads:.downloads,matchUrls:.matchUrls,feedRecordIdsToShowUuids:.feedRecordIdsToShowUuids}'
+          echo "::endgroup::"
+
+          echo "::group::c. daily (all shows)"
+          call "{\"operationKind\":\"update\",\"targetPath\":\"/show/stats\",\"parameters\":{\"date\":\"${DATE}\",\"shows\":\"exclude=\"}}" \
+            | jq -c '.results[0] | {date:.date,rows:.rows,showSizes:.showSizes}'
+          echo "::endgroup::"
+
+          echo "::group::d. compute-show-daily-downloads"
+          call "{\"operationKind\":\"update\",\"targetPath\":\"/work/compute-show-daily-downloads\",\"parameters\":{\"date\":\"${DATE}\",\"shows\":\"exclude=\"}}" \
+            | jq -c '.results[0] | {date:.date,showUuids:.showUuids}'
+          echo "::endgroup::"
+
+          echo "::group::e. recompute-show-summaries (per show)"
+          if [ -z "${SHOW_UUIDS}" ]; then echo "  no shows attached to feeds"; fi
+          for S in ${SHOW_UUIDS}; do
+            echo "  show ${S}"
+            call "{\"operationKind\":\"update\",\"targetPath\":\"/work/recompute-show-summaries\",\"parameters\":{\"show\":\"${S}\",\"month\":\"${MONTH}\",\"flags\":\"log\"}}" \
+              | jq -c '.results[0] | {downloads:.downloads,audience:.audience}' || true
+          done
+          echo "::endgroup::"
+
+          echo "Rollup complete for ${DATE}"

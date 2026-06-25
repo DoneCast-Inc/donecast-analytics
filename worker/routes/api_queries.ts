@@ -105,6 +105,48 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         return newJsonResponse({ showUuid: showUuidInput, appDownloads, queryTime, ...(debug ? { times } : {}) });
     }
 
+    if (name === 'top-countries-for-show') {
+        const targetStatsBlobs = searchParams.has('ro') ? roStatsBlobs : statsBlobs;
+        if (!targetStatsBlobs) throw new Error(`Need statsBlobs`);
+
+        const { showUuid: showUuidParam, podcastGuid, feedUrlBase64 } = Object.fromEntries(searchParams);
+        let showUuidOrPodcastGuidOrFeedUrlBase64 = '';
+        try {
+            if (typeof showUuidParam === 'string') {
+                if (!isValidUuid(showUuidParam)) throw new Error(`Bad showUuid: ${showUuidParam}`);
+                showUuidOrPodcastGuidOrFeedUrlBase64 = showUuidParam;
+            } else if (typeof podcastGuid === 'string') {
+                if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(podcastGuid)) throw new Error(`Bad podcastGuid: ${podcastGuid}`);
+                showUuidOrPodcastGuidOrFeedUrlBase64 = podcastGuid;
+            } else if (typeof feedUrlBase64 === 'string') {
+                if (!/^[0-9a-zA-Z_-]{15,}=*$/i.test(feedUrlBase64) || !isValidFeedUrlBase64(feedUrlBase64)) throw new Error(`Bad feedUrlBase64: ${feedUrlBase64}`);
+                showUuidOrPodcastGuidOrFeedUrlBase64 = feedUrlBase64;
+            }
+        } catch (e) {
+            const { message } = packError(e);
+            return newJsonResponse({ message }, 400);
+        }
+        const times: Record<string, number> = {};
+        const lookupResult = await lookupShowId({ showUuidOrPodcastGuidOrFeedUrlBase64, searchParams, rpcClient, roRpcClient, configuration, times });
+        if (lookupResult instanceof Response) return lookupResult;
+        const { showUuid, showUuidInput } = lookupResult;
+
+        const thisMonth = new Date().toISOString().substring(0, 7);
+        const latestThreeMonths = [ -2, -1, 0 ].map(v => addMonthsToMonthString(thisMonth, v));
+
+        const latestThreeMonthSummaries = await timed(times, 'get-3mo-summary', async () => (await Promise.all(latestThreeMonths.map(v => targetStatsBlobs.get(computeShowSummaryKey({ showUuid, period: v }), 'json')))).filter(isValidShowSummary));
+
+        // countryCode is rolled up per-month by show_summaries.processForShow (incrementDimension('countryCode', ...)).
+        // Sum the last three months into a single { countryCode: downloads } map, descending.
+        const countryDownloadsAcc: Record<string, number> = {};
+        for (const summary of latestThreeMonthSummaries) {
+            incrementAll(countryDownloadsAcc, (summary.dimensionDownloads ?? {})['countryCode'] ?? {});
+        }
+        const countryDownloads = Object.fromEntries(sortBy(Object.entries(countryDownloadsAcc), v => -v[1]));
+        const queryTime = Date.now() - start;
+        return newJsonResponse({ showUuid: showUuidInput, countryDownloads, queryTime, ...(debug ? { times } : {}) });
+    }
+
     if (name === 'top-apps') {
         const times: Record<string, number> = {};
 

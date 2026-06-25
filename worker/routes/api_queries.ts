@@ -20,6 +20,7 @@ import { computeShowStatsObj, lookupShowId } from './api_shows.ts';
 import { computeAppDownloads, computeRelativeSummary, insertZeros, RelativeSummary } from './api_shared.ts';
 import { DoNames } from '../do_names.ts';
 import { EpisodeRecord, ShowRecord } from '../backend/show_controller_model.ts';
+import { METROS } from '../../app/metros.ts';
 
 type Opts = { name: string, method: string, searchParams: URLSearchParams, miscBlobs?: Blobs, roMiscBlobs?: Blobs, rpcClient: RpcClient, roRpcClient?: RpcClient, configuration: Configuration, statsBlobs?: Blobs, roStatsBlobs?: Blobs };
 
@@ -188,7 +189,17 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         for (const summary of latestThreeMonthSummaries) {
             incrementAll(downloadsAcc, (summary.dimensionDownloads ?? {})[dimension] ?? {});
         }
-        const downloads = Object.fromEntries(sortBy(Object.entries(downloadsAcc), v => -v[1]));
+        // metroCode is a numeric DMA code — relabel to human city names so the
+        // breakdown is readable (falls back to the raw code if unmapped).
+        const relabel = dimension === 'metroCode'
+            ? (k: string) => METROS[k] ?? k
+            : (k: string) => k;
+        const merged: Record<string, number> = {};
+        for (const [ k, v ] of Object.entries(downloadsAcc)) {
+            const name = relabel(k);
+            merged[name] = (merged[name] ?? 0) + v;
+        }
+        const downloads = Object.fromEntries(sortBy(Object.entries(merged), v => -v[1]));
         const queryTime = Date.now() - start;
         return newJsonResponse({ showUuid: showUuidInput, dimension, downloads, queryTime, ...(debug ? { times } : {}) });
     }

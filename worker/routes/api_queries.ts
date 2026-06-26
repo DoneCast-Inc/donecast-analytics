@@ -308,7 +308,13 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
 
         type EpisodeRow = { itemGuid: string, title: string, pubdate: string, downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null, downloadsAll: number };
 
-        const nowHour = new Date().toISOString().substring(0, 13); // 'YYYY-MM-DDTHH', UTC
+        // "Now" for launch-window elapsed checks = the latest download hour in the
+        // data, NOT the wall clock. Download timestamps are the only reliable clock
+        // here, and a window counts as elapsed once data extends past it.
+        let dataNowHour = '';
+        for (const hourly of Object.values(episodeHourlyDownloads)) {
+            for (const hr of Object.keys(hourly)) if (hr > dataNowHour) dataNowHour = hr;
+        }
         const rows: EpisodeRow[] = [];
         for (const { id, itemGuid, title, pubdateInstant } of sortBy((selectEpisodesRes.results ?? []) as EpisodeRecord[], v => v.pubdateInstant ?? episodeFirstHours[v.id] ?? `000${v.id}`, { order: 'desc' })) {
             if (rows.length >= limit) break;
@@ -326,7 +332,7 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
             //    has fully elapsed (vs. now), regardless of when downloads tail off;
             //  - null when the window hasn't elapsed yet (so the UI shows "—", not a
             //    misleading 0). computeRelativeSummary's exact-hour match dropped both.
-            const v = computeLaunchVelocity(hourlyDownloads, firstHour, nowHour);
+            const v = computeLaunchVelocity(hourlyDownloads, firstHour, dataNowHour);
             rows.push({ itemGuid, title, pubdate: pubdateInstant, downloads1: v.downloads1, downloads3: v.downloads3, downloads7: v.downloads7, downloads30: v.downloads30, downloadsAll });
         }
 

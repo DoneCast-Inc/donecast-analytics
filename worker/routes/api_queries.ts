@@ -306,15 +306,8 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         let minDownloadHour: string | undefined;
         let maxDownloadHour: string | undefined;
 
-        type EpisodeRow = { itemGuid: string, title: string | undefined, pubdate: string, downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null, downloadsAll: number };
+        type EpisodeRow = { itemGuid: string, title: string | undefined, pubdate: string, downloads1: number, downloads3: number, downloads7: number, downloads30: number, downloadsAll: number };
 
-        // "Now" for launch-window elapsed checks = the latest download hour in the
-        // data, NOT the wall clock. Download timestamps are the only reliable clock
-        // here, and a window counts as elapsed once data extends past it.
-        let dataNowHour = '';
-        for (const hourly of Object.values(episodeHourlyDownloads)) {
-            for (const hr of Object.keys(hourly)) if (hr > dataNowHour) dataNowHour = hr;
-        }
         const rows: EpisodeRow[] = [];
         for (const { id, itemGuid, title, pubdateInstant } of sortBy((selectEpisodesRes.results ?? []) as EpisodeRecord[], v => v.pubdateInstant ?? episodeFirstHours[v.id] ?? `000${v.id}`, { order: 'desc' })) {
             if (rows.length >= limit) break;
@@ -327,12 +320,11 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
                 if (minDownloadHour === undefined || hr < minDownloadHour) minDownloadHour = hr;
             }
             const downloadsAll = Object.values(hourlyDownloads).reduce((a, b) => a + b, 0);
-            // First-N-day launch velocity, robust for young episodes:
-            //  - value = downloads in [firstHour, firstHour + N*24h) when that window
-            //    has fully elapsed (vs. now), regardless of when downloads tail off;
-            //  - null when the window hasn't elapsed yet (so the UI shows "—", not a
-            //    misleading 0). computeRelativeSummary's exact-hour match dropped both.
-            const v = computeLaunchVelocity(hourlyDownloads, firstHour, dataNowHour);
+            // First-N-day launch velocity = downloads in [firstHour, firstHour+N*24h).
+            // Data only exists up to "now", so for an episode younger than a window
+            // the value is simply everything-so-far — e.g. a 24h-old episode reports
+            // the same number for 3d/7d/30d as for 24h, growing until each window fills.
+            const v = computeLaunchVelocity(hourlyDownloads, firstHour);
             rows.push({ itemGuid, title, pubdate: pubdateInstant, downloads1: v.downloads1, downloads3: v.downloads3, downloads7: v.downloads7, downloads30: v.downloads30, downloadsAll });
         }
 
@@ -355,14 +347,13 @@ function isValidFeedUrlBase64(feedUrlBase64: string): boolean {
 }
 
 // First-N-day download counts for an episode, measured from its first download
-// hour. A window's value is the downloads inside [firstHour, firstHour + N*24h);
-// it returns null until that window has fully elapsed relative to `nowHour`, so
-// a freshly-published episode shows "—" for the 7d/30d columns instead of a
-// misleading 0, while still reporting its real 24h/3d numbers.
-function computeLaunchVelocity(hourly: Record<string, number>, firstHour: string, nowHour: string): { downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null } {
-    const windowFor = (days: number): number | null => {
+// hour: the downloads inside [firstHour, firstHour + N*24h). Since the data only
+// runs up to "now", an episode younger than a window reports everything-so-far for
+// it (so a 24h-old episode shows the same number for 24h/3d/7d/30d), and the
+// windows fill in as the episode ages. Always a real count (0 if no downloads).
+function computeLaunchVelocity(hourly: Record<string, number>, firstHour: string): { downloads1: number, downloads3: number, downloads7: number, downloads30: number } {
+    const windowFor = (days: number): number => {
         const endHour = addHoursToHourString(firstHour, days * 24);
-        if (nowHour < endHour) return null; // window hasn't elapsed yet
         let sum = 0;
         for (const [ hr, count ] of Object.entries(hourly)) {
             if (hr < endHour) sum += count;

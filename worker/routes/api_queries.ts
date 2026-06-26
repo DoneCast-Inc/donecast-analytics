@@ -306,7 +306,7 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         let minDownloadHour: string | undefined;
         let maxDownloadHour: string | undefined;
 
-        type EpisodeRow = { itemGuid: string, title: string, pubdate: string, downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null, downloadsAll: number };
+        type EpisodeRow = { itemGuid: string, title: string | undefined, pubdate: string, downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null, downloadsAll: number };
 
         // "Now" for launch-window elapsed checks = the latest download hour in the
         // data, NOT the wall clock. Download timestamps are the only reliable clock

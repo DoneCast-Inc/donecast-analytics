@@ -9,7 +9,7 @@ import { packError } from '../errors.ts';
 import { newJsonResponse, newMethodNotAllowedResponse } from '../responses.ts';
 import { RpcClient } from '../rpc_model.ts';
 import { incrementAll } from '../summaries.ts';
-import { addMonthsToMonthString } from '../timestamp.ts';
+import { addHoursToHourString, addMonthsToMonthString } from '../timestamp.ts';
 import { consoleWarn } from '../tracer.ts';
 import { computeUserAgentEntityResult } from '../user_agents.ts';
 import { isValidUuid } from '../uuid.ts';
@@ -17,7 +17,7 @@ import { QUERY_RECENT_EPISODES_WITH_TRANSCRIPTS } from './api_contract.ts';
 import { isShowDownloadCountsResponse, isValidRecentEpisodes } from './api_queries_model.ts';
 import { normalizeDevice } from './api_query_common.ts';
 import { computeShowStatsObj, lookupShowId } from './api_shows.ts';
-import { computeAppDownloads, computeRelativeSummary, insertZeros, RelativeSummary } from './api_shared.ts';
+import { computeAppDownloads } from './api_shared.ts';
 import { DoNames } from '../do_names.ts';
 import { EpisodeRecord, ShowRecord } from '../backend/show_controller_model.ts';
 import { METROS } from '../../app/metros.ts';
@@ -306,8 +306,15 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         let minDownloadHour: string | undefined;
         let maxDownloadHour: string | undefined;
 
-        type EpisodeRow = { itemGuid: string, title: string, pubdate: string } | Pick<RelativeSummary, 'downloads1' | 'downloads3' | 'downloads7' | 'downloads30' | 'downloadsAll'>;
+        type EpisodeRow = { itemGuid: string, title: string | undefined, pubdate: string, downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null, downloadsAll: number };
 
+        // "Now" for launch-window elapsed checks = the latest download hour in the
+        // data, NOT the wall clock. Download timestamps are the only reliable clock
+        // here, and a window counts as elapsed once data extends past it.
+        let dataNowHour = '';
+        for (const hourly of Object.values(episodeHourlyDownloads)) {
+            for (const hr of Object.keys(hourly)) if (hr > dataNowHour) dataNowHour = hr;
+        }
         const rows: EpisodeRow[] = [];
         for (const { id, itemGuid, title, pubdateInstant } of sortBy((selectEpisodesRes.results ?? []) as EpisodeRecord[], v => v.pubdateInstant ?? episodeFirstHours[v.id] ?? `000${v.id}`, { order: 'desc' })) {
             if (rows.length >= limit) break;
@@ -319,11 +326,16 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
                 if (maxDownloadHour === undefined || hr > maxDownloadHour) maxDownloadHour = hr;
                 if (minDownloadHour === undefined || hr < minDownloadHour) minDownloadHour = hr;
             }
-            const relativeSummary = computeRelativeSummary(insertZeros(hourlyDownloads));
-            const { downloads1, downloads3, downloads7, downloads30, downloadsAll } = relativeSummary;
-            rows.push({ itemGuid, title, pubdate: pubdateInstant, downloads1, downloads3, downloads7, downloads30, downloadsAll });
+            const downloadsAll = Object.values(hourlyDownloads).reduce((a, b) => a + b, 0);
+            // First-N-day launch velocity, robust for young episodes:
+            //  - value = downloads in [firstHour, firstHour + N*24h) when that window
+            //    has fully elapsed (vs. now), regardless of when downloads tail off;
+            //  - null when the window hasn't elapsed yet (so the UI shows "—", not a
+            //    misleading 0). computeRelativeSummary's exact-hour match dropped both.
+            const v = computeLaunchVelocity(hourlyDownloads, firstHour, dataNowHour);
+            rows.push({ itemGuid, title, pubdate: pubdateInstant, downloads1: v.downloads1, downloads3: v.downloads3, downloads7: v.downloads7, downloads30: v.downloads30, downloadsAll });
         }
-    
+
         const queryTime = Date.now() - start;
         return newJsonResponse({ showUuid, showTitle, minDownloadHour, maxDownloadHour, episodes: rows, queryTime, ...(debug ? { times: removeZeroValues(times) } : {}) });
     }
@@ -340,6 +352,24 @@ function isValidFeedUrlBase64(feedUrlBase64: string): boolean {
     } catch {
         return false;
     }
+}
+
+// First-N-day download counts for an episode, measured from its first download
+// hour. A window's value is the downloads inside [firstHour, firstHour + N*24h);
+// it returns null until that window has fully elapsed relative to `nowHour`, so
+// a freshly-published episode shows "—" for the 7d/30d columns instead of a
+// misleading 0, while still reporting its real 24h/3d numbers.
+function computeLaunchVelocity(hourly: Record<string, number>, firstHour: string, nowHour: string): { downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null } {
+    const windowFor = (days: number): number | null => {
+        const endHour = addHoursToHourString(firstHour, days * 24);
+        if (nowHour < endHour) return null; // window hasn't elapsed yet
+        let sum = 0;
+        for (const [ hr, count ] of Object.entries(hourly)) {
+            if (hr < endHour) sum += count;
+        }
+        return sum;
+    };
+    return { downloads1: windowFor(1), downloads3: windowFor(3), downloads7: windowFor(7), downloads30: windowFor(30) };
 }
 
 function removeZeroValues(obj: Record<string, number>): Record<string, number> {

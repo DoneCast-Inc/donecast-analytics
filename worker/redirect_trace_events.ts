@@ -78,7 +78,7 @@ export async function computeRedirectTraceEvent({ request, redirectRequest, vali
             const date = timeUuid.substring(0, 10);
             botType = trySync('bot-type', () => {
                 const tags = isWebWidget ? 'web-widget' : '';
-                return computeBotType({ agentType, agentName, deviceType, referrerName, tags, date });
+                return computeBotType({ agentType, agentName, deviceType, referrerName, tags, date, asn: asnStr });
             });
             const month = date.substring(0, 7);
             if (kvNamespace) {

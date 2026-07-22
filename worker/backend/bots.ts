@@ -1,6 +1,6 @@
-export type BotType = 'bot' | 'bot-lib' | 'unknown-bot' | 'bot-ip' | 'opera-desktop-sans-referrer' | 'no-ua' | 'podverse-web-preload' | 'web-widget-preload' | 'crosszone';
+export type BotType = 'bot' | 'bot-lib' | 'unknown-bot' | 'bot-ip' | 'opera-desktop-sans-referrer' | 'no-ua' | 'podverse-web-preload' | 'web-widget-preload' | 'crosszone' | 'datacenter' | 'desktop-browser-sans-referrer' | 'self-test';
 
-export function computeBotType({ agentType, agentName = '', deviceType, referrerName, tags = '', date }: { agentType: string, agentName?: string, deviceType?: string, referrerName?: string, tags?: string, date: string }): BotType | undefined {
+export function computeBotType({ agentType, agentName = '', deviceType, referrerName, tags = '', date, asn }: { agentType: string, agentName?: string, deviceType?: string, referrerName?: string, tags?: string, date: string, asn?: string }): BotType | undefined {
     if (agentType === 'bot') return 'bot'; // easy
     if (agentType === 'bot-library') return 'bot-lib'; // user-agents-v2 type='library' with category='bot'
     if (agentType === 'unknown' && /(bot|crawler|spider)/i.test(agentName)) return 'unknown-bot'; // "bot", "crawler" or "spider" in the user-agent string for unknown agents
@@ -21,6 +21,25 @@ export function computeBotType({ agentType, agentName = '', deviceType, referrer
 
     // 2025-08-09: Unknown crosszone requests - subrequests from other cf workers use the hardcoded crosszone ip (not the listener ip)
     if (tags.includes('unknown-crosszone')) return 'crosszone';
+
+    // 2026-07-21: Generic browser/unknown agents requesting enclosures from hosting/cloud
+    // ASNs are scrapers, not listeners (IAB guidelines exclude data-center traffic).
+    // Observed on DoneCast: headless "Chrome" fleets on Alibaba SG, Meta's crawler,
+    // Zerodesk, AWS, Hetzner, Tencent — none identify as a podcast app. Known apps and
+    // device media libraries (AppleCoreMedia etc.) are deliberately NOT excluded here:
+    // real listeners on VPNs/private relays egress from some of these same networks.
+    if ((agentType === 'browser' || agentType === 'unknown') && asn !== undefined && hostingAsns.has(asn)) return 'datacenter';
+
+    // 2026-07-21 (DoneCast): desktop-browser enclosure fetches with NO referrer are
+    // residential-proxy scrapers, not listeners — observed 250/251 such requests sprayed
+    // across 154 consumer ASNs worldwide (UY/UZ/DZ/SN/MV/... 1-5 hits each), a botnet
+    // signature. Real browser listens come from a web-player page, which sends a
+    // referrer (those stay counted, as do mobile browsers). Generalizes the upstream
+    // opera-desktop-sans-referrer precedent to all desktop browsers.
+    if (agentType === 'browser' && deviceType === 'computer' && referrerName === undefined) return 'desktop-browser-sans-referrer';
+
+    // 2026-07-21 (DoneCast): our own diagnostic probes must never count as downloads.
+    if (agentName.includes('DonecastDiag')) return 'self-test';
 }
 
 export function isWebWidgetHostname(hostname: string): boolean {
@@ -36,6 +55,54 @@ export function isBotIpHash({ hashedIpAddress, destinationServerUrl, asn, agentN
 }
 
 //
+
+// Cloud/hosting/CDN provider ASNs — no residential listeners originate here.
+// Curated from traffic observed on DoneCast plus the major providers; extend as
+// new scraper fleets show up (check stats/downloads/show-daily TSVs, `asn` column).
+const hostingAsns = new Set([
+    '45102',  // Alibaba Cloud (intl) — observed: headless Chrome fleet, SG
+    '37963',  // Alibaba Cloud (CN)
+    '32934',  // Facebook/Meta — observed: crawler with Chrome/Edge UA
+    '214266', // Zerodesk Ltd — observed: headless Chrome, HK/US
+    '16509',  // Amazon AWS
+    '14618',  // Amazon AWS (EC2 us-east) — observed
+    '8987',   // Amazon AWS (Europe)
+    '24940',  // Hetzner — observed
+    '132203', // Tencent Cloud (intl) — observed
+    '45090',  // Tencent Cloud (CN)
+    '396982', // Google Cloud
+    '8075',   // Microsoft Azure
+    '13335',  // Cloudflare
+    '14061',  // DigitalOcean
+    '16276',  // OVH
+    '63949',  // Akamai/Linode
+    '20473',  // Vultr/Choopa
+    '12876',  // Scaleway
+    '51167',  // Contabo
+    '9009',   // M247
+    '212238', // Datacamp/CDN77
+    '60068',  // Datacamp/CDN77
+    '60781',  // Leaseweb NL
+    '33425',  // CoreWeave
+    '399296', // Rackdog
+    '398465', // Rackdog
+    '31898',  // Oracle Cloud
+    '36351',  // IBM SoftLayer
+    '55990',  // Huawei Cloud
+    '136787', // PacketHub (NordVPN infra)
+    '141039', // PacketHub
+    '25820',  // IT7 Networks
+    '48090',  // DMZHost/Techoff
+    '202662', // Hytron
+    '931',    // Hyonix
+    '58065',  // Packet Exchange
+    '53850',  // GorillaServers
+    '62874',  // Web2Objects
+    '40676',  // Psychz Networks
+    '36352',  // ColoCrossing
+    '19318',  // Interserver
+    '8100',   // QuadraNet
+]);
 
 const knownWebWidgetHostnames = new Set([
     'widget.podfriend.com',

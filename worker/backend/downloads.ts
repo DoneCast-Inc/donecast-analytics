@@ -346,7 +346,7 @@ export async function computeDailyDownloads({ date, mode, showUuids, multipartMo
             if (partitions[showUuid ?? ''] !== partition) continue;
             
             // associate download with bot type
-            const botType = computeBotType({ agentType, agentName, deviceType, referrerName, tags, date });
+            const botType = computeBotType({ agentType, agentName, deviceType, referrerName, tags, date, asn });
 
             const line = [ time, episodeId, botType, serverUrl, audienceId, showUuid, hashedIpAddress, agentType, agentName, deviceType, deviceName, referrerType, referrerName, countryCode, continentCode, regionCode, regionName, timezone, metroCode, asn, tags ].map(v => v ?? '').join('\t') + '\n';
             const chunk = encoder.encode(line);

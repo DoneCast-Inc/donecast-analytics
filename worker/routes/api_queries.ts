@@ -306,7 +306,7 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
         let minDownloadHour: string | undefined;
         let maxDownloadHour: string | undefined;
 
-        type EpisodeRow = { itemGuid: string, title: string | undefined, pubdate: string, downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null, downloadsAll: number };
+        type EpisodeRow = { itemGuid: string, title: string | undefined, pubdate: string | undefined, downloads1: number | null, downloads3: number | null, downloads7: number | null, downloads30: number | null, downloadsAll: number };
 
         // "Now" for launch-window elapsed checks = the latest download hour in the
         // data, NOT the wall clock. Download timestamps are the only reliable clock
@@ -320,8 +320,6 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
             if (rows.length >= limit) break;
             const hourlyDownloads = episodeHourlyDownloads[id]; if (!hourlyDownloads) continue;
             const firstHour = episodeFirstHours[id]; if (!firstHour) continue;
-            if (firstHour < earliestMonth) continue;
-            if (pubdateInstant === undefined || pubdateInstant < earliestMonth) continue;
             for (const hr of Object.keys(hourlyDownloads)) {
                 if (maxDownloadHour === undefined || hr > maxDownloadHour) maxDownloadHour = hr;
                 if (minDownloadHour === undefined || hr < minDownloadHour) minDownloadHour = hr;
@@ -332,7 +330,13 @@ export async function computeQueriesResponse({ name, method, searchParams, miscB
             //    has fully elapsed (vs. now), regardless of when downloads tail off;
             //  - null when the window hasn't elapsed yet (so the UI shows "—", not a
             //    misleading 0). computeRelativeSummary's exact-hour match dropped both.
-            const v = computeLaunchVelocity(hourlyDownloads, firstHour, dataNowHour);
+            // Velocity is only meaningful when the episode LAUNCHED inside the tracked
+            // range. Back-catalog episodes (published before tracking began, or unknown
+            // pubdate) still report their true downloadsAll with null velocity windows —
+            // previously they were dropped entirely, hiding all back-catalog downloads
+            // (observed: 77 of 95 real downloads invisible in the per-episode list).
+            const launchTracked = pubdateInstant !== undefined && pubdateInstant >= earliestMonth && firstHour >= earliestMonth;
+            const v = launchTracked ? computeLaunchVelocity(hourlyDownloads, firstHour, dataNowHour) : { downloads1: null, downloads3: null, downloads7: null, downloads30: null };
             rows.push({ itemGuid, title, pubdate: pubdateInstant, downloads1: v.downloads1, downloads3: v.downloads3, downloads7: v.downloads7, downloads30: v.downloads30, downloadsAll });
         }
 

@@ -95,14 +95,15 @@ jobs:
           # The GET returns the module wrapped in a multipart envelope; strip
           # it so the byte-compare sees only the script body.
           python3 - <<'PY'
-          import re
+          import re, sys
           raw = open('deployed.raw', 'rb').read()
           m = re.match(rb'^--[0-9a-fA-F]+\r?\n(?:[^\r\n]+\r?\n)*\r?\n(.*)\r?\n--[0-9a-fA-F]+--\s*$', raw, re.S)
-          open('deployed.js', 'wb').write(m.group(1) if m else raw)
+          deployed = (m.group(1) if m else raw).replace(b'\r\n', b'\n').rstrip()
+          uploaded = open('worker.js', 'rb').read().replace(b'\r\n', b'\n').rstrip()
+          if deployed == uploaded:
+              print('VERIFIED: deployed script content matches upload (modulo trailing whitespace)')
+          else:
+              print('MISMATCH between uploaded and deployed content')
+              open('deployed.js', 'wb').write(deployed)
+              sys.exit(1)
           PY
-          # tolerate a single trailing-newline difference from the envelope strip
-          if cmp -s worker.js deployed.js || cmp -s <(cat worker.js; printf '\n') <(cat deployed.js; printf '\n'); then
-            echo "VERIFIED: deployed script content matches upload byte-for-byte"
-          else
-            echo "MISMATCH between uploaded and deployed content:"; diff worker.js deployed.js || true; exit 1
-          fi

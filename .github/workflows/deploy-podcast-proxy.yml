@@ -1,0 +1,81 @@
+# Deploys the donecast.com wildcard-subdomain worker (cloudflare-workers/
+# podcast-proxy/worker.js in the main DoneCast repo). This workflow lives HERE
+# because this repo holds the only Workers-scope CF_API_TOKEN — the dev box has
+# no Workers credential (see DoneCast PR #1767). Manual dispatch only; the
+# script content is passed in as base64 so no cross-repo checkout is needed.
+name: Deploy podcast-proxy worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "list = show account worker scripts + current settings; deploy = upload script"
+        required: true
+        default: list
+        type: choice
+        options: [list, deploy]
+      script_name:
+        description: "Cloudflare worker script name (deploy mode)"
+        required: false
+        default: ""
+      script_b64:
+        description: "base64 of the ES-module worker.js (deploy mode)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-22.04
+    env:
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+    steps:
+      - name: List worker scripts
+        if: ${{ inputs.mode == 'list' }}
+        run: |
+          curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts" \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print('success:', d['success'], d['errors']); [print(s['id'], ' modified=', s.get('modified_on')) for s in d.get('result') or []]"
+
+      - name: Show current settings for script
+        if: ${{ inputs.mode == 'deploy' }}
+        run: |
+          test -n "${{ inputs.script_name }}" || { echo "script_name is required"; exit 1; }
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/settings"
+          echo
+
+      - name: Deploy script
+        if: ${{ inputs.mode == 'deploy' }}
+        run: |
+          set -e
+          test -n "${{ inputs.script_b64 }}" || { echo "script_b64 is required"; exit 1; }
+          echo "${{ inputs.script_b64 }}" | base64 -d > worker.js
+          echo "--- uploading $(wc -c < worker.js) bytes ---"
+          # keep_bindings preserves any existing bindings/secrets; routes and
+          # custom domains are attached outside script content and survive PUTs.
+          cat > metadata.json <<'META'
+          {"main_module": "worker.js",
+           "compatibility_date": "2024-01-01",
+           "keep_bindings": ["secret_text", "plain_text", "kv_namespace", "r2_bucket", "d1", "durable_object_namespace", "queue", "analytics_engine", "service"]}
+          META
+          curl -sf -X PUT \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            -F "metadata=@metadata.json;type=application/json" \
+            -F "worker.js=@worker.js;type=application/javascript+module" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}" \
+          | python3 -c 'import json,sys; d=json.load(sys.stdin); print("success:", d["success"]); print("errors:", d["errors"])'
+
+      - name: Verify uploaded content round-trip
+        if: ${{ inputs.mode == 'deploy' }}
+        run: |
+          curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}" > deployed.js
+          if cmp -s worker.js deployed.js; then
+            echo "VERIFIED: deployed script content matches upload byte-for-byte"
+          else
+            echo "MISMATCH between uploaded and deployed content:"; diff worker.js deployed.js || true; exit 1
+          fi

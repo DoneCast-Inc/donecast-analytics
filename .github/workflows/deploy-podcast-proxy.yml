@@ -48,6 +48,24 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/settings"
           echo
 
+      - name: Backup current script and sanity-check target
+        if: ${{ inputs.mode == 'deploy' }}
+        run: |
+          set -e
+          curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}" > backup-${{ inputs.script_name }}.js
+          echo "--- current deployed content (first 30 lines) ---"
+          head -30 "backup-${{ inputs.script_name }}.js"
+          # refuse to overwrite a script that isn't the wildcard subdomain proxy
+          grep -q "subdomain" "backup-${{ inputs.script_name }}.js" || { echo "ABORT: target does not look like the subdomain proxy"; exit 1; }
+
+      - name: Upload backup artifact
+        if: ${{ inputs.mode == 'deploy' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-deploy-backup-${{ inputs.script_name }}
+          path: backup-${{ inputs.script_name }}.js
+
       - name: Deploy script
         if: ${{ inputs.mode == 'deploy' }}
         run: |

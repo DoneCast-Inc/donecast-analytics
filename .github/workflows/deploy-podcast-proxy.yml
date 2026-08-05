@@ -91,8 +91,17 @@ jobs:
         if: ${{ inputs.mode == 'deploy' }}
         run: |
           curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}" > deployed.js
-          if cmp -s worker.js deployed.js; then
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}" > deployed.raw
+          # The GET returns the module wrapped in a multipart envelope; strip
+          # it so the byte-compare sees only the script body.
+          python3 - <<'PY'
+          import re
+          raw = open('deployed.raw', 'rb').read()
+          m = re.match(rb'^--[0-9a-fA-F]+\r?\n(?:[^\r\n]+\r?\n)*\r?\n(.*)\r?\n--[0-9a-fA-F]+--\s*$', raw, re.S)
+          open('deployed.js', 'wb').write(m.group(1) if m else raw)
+          PY
+          # tolerate a single trailing-newline difference from the envelope strip
+          if cmp -s worker.js deployed.js || cmp -s <(cat worker.js; printf '\n') <(cat deployed.js; printf '\n'); then
             echo "VERIFIED: deployed script content matches upload byte-for-byte"
           else
             echo "MISMATCH between uploaded and deployed content:"; diff worker.js deployed.js || true; exit 1

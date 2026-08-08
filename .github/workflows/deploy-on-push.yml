@@ -1,5 +1,8 @@
 name: Deploy on push
-on: [push]
+# workflow_dispatch exists for secret rotation: the worker only picks up
+# changed secret bindings (adminTokens/previewTokens) on a deploy, and
+# deploy.sh early-exits when the deployed SHA already matches.
+on: [push, workflow_dispatch]
 
 permissions:
   contents: read
@@ -14,7 +17,10 @@ jobs:
   deploy-prod:
     runs-on: ubuntu-22.04
     env:
-      DEPLOY_SHA: ${{ github.sha }}
+      # A manual dispatch is always a forced deploy (blank DEPLOY_SHA skips
+      # deploy.sh's already-deployed early exit) — that's the whole point of
+      # dispatching: rebinding rotated secrets without a code change.
+      DEPLOY_SHA: ${{ github.event_name == 'workflow_dispatch' && '' || github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3

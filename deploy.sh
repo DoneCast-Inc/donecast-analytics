@@ -25,8 +25,25 @@ if [ -n "$DEPLOY_SHA" ]; then
   echo "DEPLOYED_SHA: $DEPLOYED_SHA"
 fi
 
+# In prod, refuse to deploy without a real admin token set. An unset ADMIN_TOKENS
+# secret falls back to the literal 'optional' (see .github/workflows/deploy-on-push.yml),
+# which binds a placeholder admin token — every provisioning POST to
+# /api/1/notifications then 403s as "unknown user". Fail loudly here instead of
+# shipping a silent outage.
+if [ "$INSTANCE" = "prod" ] && { [ -z "$ADMIN_TOKENS" ] || [ "$ADMIN_TOKENS" = "optional" ]; }; then
+  echo "ERROR: ADMIN_TOKENS is unset or a placeholder for a prod deploy (value: '${ADMIN_TOKENS:-<empty>}')." >&2
+  echo "Refusing to bind a placeholder admin token set. Set the ADMIN_TOKENS GitHub secret, then re-run:" >&2
+  echo "  Actions -> 'Deploy on push' -> Run workflow (a manual dispatch force-redeploys and rebinds the rotated secret)." >&2
+  exit 1
+fi
+
 # run unit tests as a sanity check
 NO_COLOR=1 DENO_VERSION=$DENO_VERSION DENOFLARE_VERSION=${DENOFLARE_VERSION} ./deno-$DENO_VERSION/bin/deno test --allow-read
+
+# Diagnostic: confirm a rotation actually carried tokens (counts only — never values).
+_admin_count=$(printf '%s' "$ADMIN_TOKENS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+_preview_count=$(printf '%s' "$PREVIEW_TOKENS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+echo "binding $_admin_count admin token(s), $_preview_count preview token(s)"
 
 # denoflare push the worker script to cloudflare
 NO_COLOR=1 DENO_VERSION=$DENO_VERSION DENOFLARE_VERSION=${DENOFLARE_VERSION} ./deno-$DENO_VERSION/bin/deno run --allow-all https://raw.denoflare.dev/skymethod/denoflare/$DENOFLARE_VERSION/cli/cli.ts \

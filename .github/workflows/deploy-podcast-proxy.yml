@@ -156,11 +156,37 @@ jobs:
         if: ${{ inputs.mode == 'deploy' && inputs.route_pattern != '' }}
         run: |
           set -e
-          ZONE_ID=$(curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/zones?name=${{ inputs.route_zone }}" \
-          | python3 -c "import json,sys; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')")
-          test -n "$ZONE_ID" || { echo "ABORT: could not resolve zone ${{ inputs.route_zone }} (token may lack zone read)"; exit 1; }
+          # The token can see zones in more than one account (the pre-cutover
+          # personal copy of donecast.com still exists in "moved" status as
+          # the rollback) — only the ACTIVE zone serves traffic, so routes
+          # must land there. Also clean this pattern off any non-active
+          # same-name zone, where it would be inert-but-confusing.
+          curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=${{ inputs.route_zone }}" > zones.json
+          python3 - <<'PY'
+          import json
+          zones = json.load(open("zones.json"))["result"] or []
+          for z in zones:
+              print(f"zone candidate: {z['id']} status={z['status']} account={z.get('account', {}).get('name')}")
+          active = [z["id"] for z in zones if z["status"] == "active"]
+          open("zone_id.txt", "w").write(active[0] if len(active) == 1 else "")
+          open("other_zones.txt", "w").write("\n".join(z["id"] for z in zones if z["status"] != "active"))
+          PY
+          ZONE_ID=$(cat zone_id.txt)
+          test -n "$ZONE_ID" || { echo "ABORT: no single ACTIVE zone named ${{ inputs.route_zone }} visible to this token"; exit 1; }
           echo "zone id: $ZONE_ID"
+          while read -r OTHER; do
+            [ -n "$OTHER" ] || continue
+            curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/zones/$OTHER/workers/routes" > other_routes.json
+            RID=$(python3 -c "import json; rs=(json.load(open('other_routes.json')).get('result') or []); m=[r['id'] for r in rs if r['pattern']=='${{ inputs.route_pattern }}']; print(m[0] if m else '')")
+            if [ -n "$RID" ]; then
+              echo "removing stray route ${{ inputs.route_pattern }} from non-active zone $OTHER"
+              curl -s -X DELETE -H "Authorization: Bearer $CF_API_TOKEN" \
+                "https://api.cloudflare.com/client/v4/zones/$OTHER/workers/routes/$RID" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print("stray route removed:", d["success"], d["errors"])' || true
+            fi
+          done < other_zones.txt
           curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/workers/routes" > routes.json
           python3 - "$ZONE_ID" <<'PY' > route_action.txt

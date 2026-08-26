@@ -14,11 +14,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "list = show account worker scripts + current settings; deploy = upload script"
+        description: "list = show account worker scripts; deploy = upload script; inspect = show a script's versions + deployments; activate = deploy the script's newest version at 100%"
         required: true
         default: list
         type: choice
-        options: [list, deploy]
+        options: [list, deploy, inspect, activate]
       script_name:
         description: "Cloudflare worker script name (deploy mode)"
         required: false
@@ -65,6 +65,32 @@ jobs:
           curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts" \
           | python3 -c "import json,sys; d=json.load(sys.stdin); print('success:', d['success'], d['errors']); [print(s['id'], ' modified=', s.get('modified_on')) for s in d.get('result') or []]"
+
+      - name: Inspect versions and deployments
+        if: ${{ inputs.mode == 'inspect' || inputs.mode == 'activate' || inputs.mode == 'deploy' }}
+        run: |
+          test -n "${{ inputs.script_name }}" || { echo "script_name is required"; exit 1; }
+          echo "--- versions (newest first) ---"
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/versions" > versions.json
+          python3 -c "import json; d=json.load(open('versions.json')); items=(d.get('result') or {}).get('items') or []; [print(v['id'], v.get('metadata', {}).get('created_on'), v.get('metadata', {}).get('source')) for v in items[:5]]; print('errors:', d.get('errors'))"
+          echo "--- deployments (newest first) ---"
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/deployments" > deployments.json
+          python3 -c "import json; d=json.load(open('deployments.json')); items=(d.get('result') or {}).get('deployments') or []; [print(x.get('id'), x.get('created_on'), [(v.get('version_id'), v.get('percentage')) for v in x.get('versions', [])]) for x in items[:5]]; print('errors:', d.get('errors'))"
+
+      - name: Activate newest version at 100%
+        if: ${{ inputs.mode == 'activate' }}
+        run: |
+          set -e
+          VID=$(python3 -c "import json; d=json.load(open('versions.json')); items=(d.get('result') or {}).get('items') or []; print(items[0]['id'] if items else '')")
+          test -n "$VID" || { echo "ABORT: no versions found"; exit 1; }
+          echo "activating version $VID"
+          python3 -c "import json; json.dump({'strategy': 'percentage', 'versions': [{'version_id': '$VID', 'percentage': 100}]}, open('deploy.json', 'w'))"
+          curl -s -X POST -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" -d @deploy.json \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/deployments" \
+          | python3 -c 'import json,sys; d=json.load(sys.stdin); print("deployment created:", d["success"], d["errors"])'
 
       - name: Show current settings for script
         if: ${{ inputs.mode == 'deploy' }}

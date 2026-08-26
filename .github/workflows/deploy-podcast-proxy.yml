@@ -14,11 +14,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "list = show account worker scripts; deploy = upload script; inspect = show a script's versions + deployments; activate = deploy the script's newest version at 100%"
+        description: "list = show account worker scripts; deploy = upload script; inspect = show a script's versions + deployments; activate = deploy the script's newest version at 100%; expose/unexpose = toggle the script's workers.dev URL"
         required: true
         default: list
         type: choice
-        options: [list, deploy, inspect, activate]
+        options: [list, deploy, inspect, activate, expose, unexpose]
       script_name:
         description: "Cloudflare worker script name (deploy mode)"
         required: false
@@ -91,6 +91,21 @@ jobs:
             -H "Content-Type: application/json" -d @deploy.json \
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/deployments" \
           | python3 -c 'import json,sys; d=json.load(sys.stdin); print("deployment created:", d["success"], d["errors"])'
+
+      - name: Toggle workers.dev exposure
+        if: ${{ inputs.mode == 'expose' || inputs.mode == 'unexpose' }}
+        run: |
+          set -e
+          test -n "${{ inputs.script_name }}" || { echo "script_name is required"; exit 1; }
+          echo "--- account workers.dev subdomain ---"
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/subdomain" \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print('subdomain:', (d.get('result') or {}).get('subdomain'), 'errors:', d['errors'])"
+          WANT=$([ "${{ inputs.mode }}" = "expose" ] && echo true || echo false)
+          curl -s -X POST -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"enabled\": $WANT}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/subdomain" \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print('workers.dev enabled set:', d.get('success'), d.get('errors'))"
 
       - name: Show current settings for script
         if: ${{ inputs.mode == 'deploy' }}

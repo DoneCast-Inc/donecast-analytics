@@ -56,7 +56,7 @@ push ./worker/worker.ts --account-id $CF_ACCOUNT_ID --api-token $CF_API_TOKEN --
 --text-binding deploySha:$DEPLOY_SHA \
 --text-binding deployFrom:$DEPLOY_FROM \
 --text-binding origin:https://$CF_CUSTOM_DOMAIN \
---do-namespace-binding backendNamespace:$CF_BACKEND_DO_NAMESPACE:BackendDO \
+--do-namespace-binding backendNamespace:$CF_BACKEND_DO_NAMESPACE:BackendDO:backend=sql \
 --do-namespace-binding backendSqlNamespace:$CF_BACKEND_SQL_DO_NAMESPACE:BackendSqlDO:backend=sql \
 --secret-binding adminTokens:$ADMIN_TOKENS \
 --secret-binding previewTokens:$PREVIEW_TOKENS \

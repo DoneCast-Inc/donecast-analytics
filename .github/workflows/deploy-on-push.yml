@@ -39,8 +39,13 @@ jobs:
           # Storage + ingestion backend. Without these the worker redirects but
           # never RECORDS a download: HitsController/ShowController throw without
           # blobsBucket, and the recording path is skipped when queue2 is unbound.
+          # Podcast Index API credentials (apiKey:apiSecret). deploy.sh only binds
+          # podcastIndexCredentials when this is non-empty, so an unset secret is a
+          # no-op for the deploy — but the show server needs the binding for feed
+          # lookups, and never received it because it wasn't passed through here.
+          PODCAST_INDEX_CREDENTIALS: ${{ secrets.PODCAST_INDEX_CREDENTIALS }}
           BLOBS_BUCKET: analytics-blobs
-          KV_NAMESPACE: 8d26dc68be8547548d65620c991d1c7f
+          KV_NAMESPACE: 0dda1ac5a883470b9f2f331308cad3e5
           QUEUE1_NAME: op3-donecast-queue1
           QUEUE2_NAME: op3-donecast-queue2
 

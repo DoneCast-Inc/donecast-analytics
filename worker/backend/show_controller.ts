@@ -26,7 +26,7 @@ export class ShowController {
 
     private readonly storage: DurableObjectStorage;
     private readonly durableObjectName: string;
-    private readonly podcastIndexClient: PodcastIndexClient;
+    private readonly podcastIndexClient: PodcastIndexClient | undefined; // only required for Podcast Index lookups (work), not for serving stored data
     private readonly notifications: ShowControllerNotifications;
     private readonly origin: string;
     private readonly feedBlobs: Blobs;
@@ -37,7 +37,7 @@ export class ShowController {
     private readonly allowStorageImport: boolean;
     private readonly xfetcher?: string;
 
-    constructor({ storage, durableObjectName, podcastIndexClient, origin, feedBlobs, statsBlobs, rpcClient, allowStorageImport, xfetcher }: { storage: DurableObjectStorage, durableObjectName: string, podcastIndexClient: PodcastIndexClient, origin: string, feedBlobs: Blobs, statsBlobs: Blobs, rpcClient: RpcClient, allowStorageImport: boolean, xfetcher: string | undefined }) {
+    constructor({ storage, durableObjectName, podcastIndexClient, origin, feedBlobs, statsBlobs, rpcClient, allowStorageImport, xfetcher }: { storage: DurableObjectStorage, durableObjectName: string, podcastIndexClient: PodcastIndexClient | undefined, origin: string, feedBlobs: Blobs, statsBlobs: Blobs, rpcClient: RpcClient, allowStorageImport: boolean, xfetcher: string | undefined }) {
         this.storage = storage;
         this.durableObjectName = durableObjectName;
         this.podcastIndexClient = podcastIndexClient;
@@ -552,6 +552,11 @@ export class ShowController {
     async work(): Promise<void> {
         const { storage, podcastIndexClient, durableObjectName } = this;
         const infos: string[] = [];
+        // only work records that call out to the Podcast Index need credentials, so demand them here rather than at init
+        const requirePodcastIndexClient = () => {
+            if (!podcastIndexClient) throw new Error(`Valid 'podcastIndexCredentials' are required to look up feeds in the Podcast Index`);
+            return podcastIndexClient;
+        }
         try {
             const limit = 20;
             const map = await storage.list({ prefix: 'sc.work0.', end: `sc.work0.${computeTimestamp()}`, limit });
@@ -561,9 +566,9 @@ export class ShowController {
                     const r = record;
                     infos.push(r.kind);
                     if (r.kind === 'lookup-pg') {
-                        await lookupPodcastGuid(r.podcastGuid, storage, podcastIndexClient);
+                        await lookupPodcastGuid(r.podcastGuid, storage, requirePodcastIndexClient());
                     } else if (r.kind === 'lookup-feed') {
-                        await lookupFeed(r.feedUrl, storage, podcastIndexClient);
+                        await lookupFeed(r.feedUrl, storage, requirePodcastIndexClient());
                     } else {
                         consoleWarn('sc-work', `Unsupported work kind: ${JSON.stringify(record)}`);
                     }

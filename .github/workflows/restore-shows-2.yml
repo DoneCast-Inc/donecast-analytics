@@ -1,0 +1,174 @@
+name: Restore show registry (stage 2)
+# TEMPORARY. Authorized write operation. Stage 2 of the 2026-08-27 registry wipe
+# recovery: restores the remaining 17 shows the same way stage 1 restored
+# Cinema IRL.
+#
+# Per show, exactly two mutating calls:
+#   1. POST /api/1/notifications (type=feeds) -> creates the FeedRecord
+#   2. POST /api/1/admin/data action=set-show-uuid WITH an explicit show-uuid
+#      (omitting it mints a NEW random uuid and orphans the show's history)
+#
+# The demo feed https://rss.donecast.com/rss/demo-simon-hedley/feed.xml is
+# deliberately NOT included: it is a copy of Cinema IRL and shares its
+# podcastGuid, so binding it would hijack the podcastGuid -> showUuid index.
+#
+# Delete this workflow once the restore is verified.
+on:
+  push:
+    branches: [claude/slack-session-9d7l6b]
+
+permissions:
+  contents: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 50
+    env:
+      ADMIN_TOKENS: ${{ secrets.ADMIN_TOKENS }}
+      ORIGIN: https://analytics.donecast.com
+    steps:
+      - name: Stage 2 - restore the remaining 17 shows
+        run: |
+          set -u
+          ADMIN_TOKEN=$(printf '%s' "${ADMIN_TOKENS:-}" | cut -d, -f1 | tr -d '[:space:]')
+          if [ -z "$ADMIN_TOKEN" ]; then echo "no admin token"; exit 1; fi
+          echo "::add-mask::$ADMIN_TOKEN"
+          UA='donecast-restore/1.0'
+
+          adminq() {
+            curl -sS -A "$UA" --max-time 30 \
+              -X POST "$ORIGIN/api/1/admin/data" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H 'Content-Type: application/json' --data "$1"
+          }
+          get() { curl -sS -A "$UA" --max-time 30 -w '\nHTTP %{http_code}\n' "$1"; }
+
+          cat > /tmp/shows.tsv <<'TSV'
+          130f6d958b664c9f8702e94500385e1d	https://rss.donecast.com/rss/the-people-i-meet/feed.xml
+          22bf4f16a51047889a1ec17fc242a89d	https://rss.donecast.com/rss/the-demo-show/feed.xml
+          298ee9a52ac24c31beab60c5e24f452d	https://rss.donecast.com/rss/icons-of-influence/feed.xml
+          31814805bacc4db48f6bf3c4070d341f	https://rss.donecast.com/rss/pay-my-rent/feed.xml
+          323277debacf4700b10b088e845ca62a	https://rss.donecast.com/rss/testing/feed.xml
+          4d505ff1b7564b40b747378804e24c7a	https://rss.donecast.com/rss/the-habit-sketchbook/feed.xml
+          5b6e8fb6330347b3a6a9ae607ee24e9b	https://rss.donecast.com/rss/social-sales-masterclass/feed.xml
+          66c8f39415c04aed86c5fc751f39ca38	https://rss.donecast.com/rss/playgrounded/feed.xml
+          7830099bc82549f1b22a57945fe6148c	https://rss.donecast.com/rss/social-selling-secrets/feed.xml
+          7838cf69ffaf4086b50d9112f099dea2	https://rss.donecast.com/rss/deathcare-marketing/feed.xml
+          adebbec1820c47b3a49adb3e28d61a52	https://rss.donecast.com/rss/flow-state-university/feed.xml
+          b1c53d222d2949bd9de0d657144af448	https://rss.donecast.com/rss/scoberland/feed.xml
+          c4a6940c55a54c8e82aab23793c10a00	https://rss.donecast.com/rss/middle-school/feed.xml
+          e44e72e7891a41a88aeb26ab8965f035	https://rss.donecast.com/rss/playgrounded-2/feed.xml
+          eede09ae67794bb4b378c9dde1925894	https://rss.donecast.com/rss/the-social-closer/feed.xml
+          f192660267e547318f8a1b5dbd0880ee	https://rss.donecast.com/rss/suck-it-monday/feed.xml
+          f7f84828d2e64153982f5e797491edf9	https://rss.donecast.com/rss/ahdh-case-files/feed.xml
+          TSV
+          sed -i 's/^ *//' /tmp/shows.tsv
+          echo "shows to restore: $(wc -l < /tmp/shows.tsv)"
+          cat /tmp/shows.tsv
+
+          echo
+          echo '======================================================================'
+          echo '=== PHASE A: one feeds notification for all 17 feed urls'
+          echo '======================================================================'
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          FEEDS=$(cut -f2 /tmp/shows.tsv | jq -R '{feedUrl:.}' | jq -sc .)
+          BODY=$(jq -nc --arg now "$NOW" --argjson feeds "$FEEDS" \
+            '{type:"feeds",sent:$now,sender:"manual",feeds:$feeds}')
+          echo "body: $BODY"
+          curl -sS -A "$UA" --max-time 30 -w '\nHTTP %{http_code}\n' \
+            -X POST "$ORIGIN/api/1/notifications" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -H 'Content-Type: application/json' --data "$BODY"
+
+          echo
+          echo '======================================================================'
+          echo '=== PHASE B: poll each feed; bind its ORIGINAL uuid as soon as ready'
+          echo '======================================================================'
+          : > /tmp/done.txt
+          : > /tmp/nudged.txt
+          : > /tmp/failed.txt
+
+          for round in $(seq 1 30); do
+            PENDING=0
+            sleep 20
+            echo "----- round $round -----"
+            while IFS=$'\t' read -r UUID FEED; do
+              [ -z "${UUID:-}" ] && continue
+              if grep -qx "$UUID" /tmp/done.txt; then continue; fi
+              PENDING=$((PENDING+1))
+              SEL=$(jq -nc --arg p "/show/feeds/$FEED" '{operationKind:"select",targetPath:$p}')
+              R=$(adminq "$SEL")
+              OK=$(printf '%s' "$R" | jq -r 'if (.results[0].lastOkFetch // null) == null then "" else "yes" end' 2>/dev/null)
+              PG=$(printf '%s' "$R" | jq -r '(.results[0].piFeed.podcastGuid // .results[0].podcastGuid) // empty' 2>/dev/null)
+              TITLE=$(printf '%s' "$R" | jq -r '.results[0].title // empty' 2>/dev/null)
+              if [ -n "${OK:-}" ] && [ -n "${PG:-}" ]; then
+                BIND=$(jq -nc --arg p "/show/feeds/$FEED" --arg u "$UUID" \
+                  '{operationKind:"update",targetPath:$p,parameters:{action:"set-show-uuid","show-uuid":$u}}')
+                BR=$(adminq "$BIND")
+                echo "BIND $UUID  title=${TITLE:-?}  pg=$PG  -> $BR"
+                echo "$UUID" >> /tmp/done.txt
+              else
+                echo "wait $UUID  ($FEED)  lastOkFetch=${OK:-no} podcastGuid=${PG:-none} title=${TITLE:-none}"
+                if [ "$round" -ge 1 ] && ! grep -qx "$UUID" /tmp/nudged.txt; then
+                  echo "$UUID" >> /tmp/nudged.txt
+                  NR=$(adminq "$(jq -nc --arg p "/show/feeds/$FEED" \
+                    '{operationKind:"update",targetPath:$p,parameters:{action:"update-feed-and-index-items"}}')")
+                  echo "   nudge -> $NR"
+                fi
+              fi
+            done < /tmp/shows.tsv
+            echo "round $round: bound=$(wc -l < /tmp/done.txt) pending=$PENDING"
+            if [ "$(wc -l < /tmp/done.txt)" -ge 17 ]; then break; fi
+          done
+
+          echo
+          echo '--- shows never bound (if any), with their final feed record ---'
+          while IFS=$'\t' read -r UUID FEED; do
+            [ -z "${UUID:-}" ] && continue
+            if grep -qx "$UUID" /tmp/done.txt; then continue; fi
+            echo "$UUID" >> /tmp/failed.txt
+            echo "FAILED $UUID  $FEED"
+            adminq "$(jq -nc --arg p "/show/feeds/$FEED" '{operationKind:"select",targetPath:$p}')" | jq -c .
+          done < /tmp/shows.tsv
+
+          sleep 15
+
+          echo
+          echo '======================================================================'
+          echo '=== PHASE C: FINAL VERIFICATION (read-only)'
+          echo '======================================================================'
+          ALL=$(adminq '{"operationKind":"select","targetPath":"/show/shows","parameters":{"limit":"50"}}')
+          echo '--- raw select /show/shows (limit 50) ---'
+          printf '%s' "$ALL" | jq .
+          echo
+          echo '--- uuid / title table ---'
+          printf '%s' "$ALL" | jq -r '.results[] | "\(.uuid)\t\(.title // "?")\t\(.podcastGuid // "?")"' | sort
+
+          echo
+          echo '--- uuid match check against the expected table ---'
+          printf '%s' "$ALL" | jq -r '.results[].uuid' | sort > /tmp/live.txt
+          { cut -f1 /tmp/shows.tsv; echo a525e200d35543caa80ec4c4c65e29f4; } | sort > /tmp/expected.txt
+          echo "expected uuids present:"
+          comm -12 /tmp/expected.txt /tmp/live.txt
+          echo "EXPECTED BUT MISSING:"
+          comm -23 /tmp/expected.txt /tmp/live.txt
+          echo "UNEXPECTED (possible newly-minted uuid!):"
+          comm -13 /tmp/expected.txt /tmp/live.txt
+
+          echo
+          echo '--- per-show GET /api/1/shows/<uuid> + daily downloads row count ---'
+          while IFS=$'\t' read -r UUID FEED; do
+            [ -z "${UUID:-}" ] && continue
+            S=$(curl -sS -A "$UA" --max-time 30 -o /tmp/s.json -w '%{http_code}' "$ORIGIN/api/1/shows/$UUID?token=$ADMIN_TOKEN")
+            T=$(jq -r '.title // "?"' /tmp/s.json 2>/dev/null)
+            D=$(curl -sS -A "$UA" --max-time 30 "$ORIGIN/api/1/queries/show-daily-downloads?showUuid=$UUID&token=$ADMIN_TOKEN")
+            N=$(printf '%s' "$D" | jq -r '(.rows // .results // []) | length' 2>/dev/null)
+            F=$(printf '%s' "$D" | jq -rc '(.rows // .results // [])[0] // empty' 2>/dev/null)
+            L=$(printf '%s' "$D" | jq -rc '(.rows // .results // [])[-1] // empty' 2>/dev/null)
+            echo "$UUID  http=$S  title=$T  dailyRows=${N:-?}  first=${F:-} last=${L:-}"
+          done < /tmp/shows.tsv
+
+          echo
+          echo "bound: $(wc -l < /tmp/done.txt)/17   failed: $(wc -l < /tmp/failed.txt)"
+          echo '=== STAGE 2 DONE ==='

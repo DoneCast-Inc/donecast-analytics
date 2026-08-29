@@ -48,13 +48,15 @@ jobs:
 
           cfauth=(-H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
           aauth=(-H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json")
+          # Every request is bounded: a slow/overloaded worker must not hang the job.
+          T=(-m 30 --connect-timeout 10)
 
           trunc() { head -c 1500; echo; }
 
           echo "############################################################"
           echo "### SECTION 0 - live instance identity"
           echo "############################################################"
-          curl -sS -w $'\n[http %{http_code}]\n' "$ORIGIN/info.json" | trunc
+          curl -sS "${T[@]}" -w $'\n[http %{http_code}]\n' "$ORIGIN/info.json" | trunc
 
           echo
           echo "############################################################"
@@ -64,7 +66,7 @@ jobs:
             echo "(no admin token -- skipped)"
             : > "$WORK/registry-uuids.txt"
           else
-            curl -sS -o "$WORK/shows.json" -w '[http %{http_code}]\n' -X POST "${aauth[@]}" \
+            curl -sS "${T[@]}" -o "$WORK/shows.json" -w '[http %{http_code}]\n' -X POST "${aauth[@]}" \
               --data '{"operationKind":"select","targetPath":"/show/shows","parameters":{"limit":"50"}}' \
               "$ORIGIN/api/1/admin/data"
             echo "--- raw (truncated) ---"
@@ -91,7 +93,7 @@ jobs:
             while [ "$page" -le "$maxpages" ]; do
               url="$API/accounts/$CF_ACCOUNT_ID/r2/buckets/$BUCKET/objects?per_page=100&prefix=$prefix"
               [ -n "$cursor" ] && url="$url&cursor=$cursor"
-              body=$(curl -sS -w $'\n%{http_code}' "${cfauth[@]}" "$url" 2>&1)
+              body=$(curl -sS "${T[@]}" -w $'\n%{http_code}' "${cfauth[@]}" "$url" 2>&1)
               code=$(printf '%s' "$body" | tail -n1)
               body=$(printf '%s' "$body" | sed '$d')
               n=$(printf '%s' "$body" | jq -r '((.result // []) | if type=="object" then .objects else . end | length) // 0' 2>/dev/null)
@@ -139,12 +141,16 @@ jobs:
           else
             probe() {
               echo "--- GET $1"
-              curl -sS -w $'\n[http %{http_code}]\n' "$ORIGIN$2" | trunc
+              curl -sS "${T[@]}" -w $'\n[http %{http_code}]\n' "$ORIGIN$2" | trunc
               echo
             }
-            # Known uuid first, then everything else found in R2, then registry uuids.
-            { echo "$KNOWN_UUID"; cat "$WORK/history-uuids.txt" 2>/dev/null; \
-              jq -r '(.results // [])[].uuid' "$WORK/shows.json" 2>/dev/null; } | sort -u > "$WORK/probe-uuids.txt"
+            # Known uuid first, then registry uuids, then everything else found in
+            # R2. Capped so a large R2 history can't stretch the job past its
+            # timeout -- 7 probes per uuid adds up fast.
+            { echo "$KNOWN_UUID"; jq -r '(.results // [])[].uuid' "$WORK/shows.json" 2>/dev/null; \
+              cat "$WORK/history-uuids.txt" 2>/dev/null; } | awk 'NF && !seen[$0]++' > "$WORK/all-probe-uuids.txt"
+            echo "probe candidates: $(wc -l < "$WORK/all-probe-uuids.txt") (probing at most 8)"
+            head -8 "$WORK/all-probe-uuids.txt" > "$WORK/probe-uuids.txt"
             while read -r U; do
               [ -z "$U" ] && continue
               echo "=================================================="
@@ -167,16 +173,16 @@ jobs:
             echo "### SECTION 3b - does the show server know the historical uuid?"
             echo "############################################################"
             echo "--- admin select /show/shows/$KNOWN_UUID ---"
-            curl -sS -w $'\n[http %{http_code}]\n' -X POST "${aauth[@]}" \
+            curl -sS "${T[@]}" -w $'\n[http %{http_code}]\n' -X POST "${aauth[@]}" \
               --data "{\"operationKind\":\"select\",\"targetPath\":\"/show/shows/$KNOWN_UUID\"}" \
               "$ORIGIN/api/1/admin/data" | trunc
             echo "--- admin select /show/feeds (limit 25) ---"
-            curl -sS -w $'\n[http %{http_code}]\n' -X POST "${aauth[@]}" \
+            curl -sS "${T[@]}" -w $'\n[http %{http_code}]\n' -X POST "${aauth[@]}" \
               --data '{"operationKind":"select","targetPath":"/show/feeds","parameters":{"limit":"25"}}' \
               "$ORIGIN/api/1/admin/data" | head -c 4000
             echo
             echo "--- admin select /show/show-uuids ---"
-            curl -sS -w $'\n[http %{http_code}]\n' -X POST "${aauth[@]}" \
+            curl -sS "${T[@]}" -w $'\n[http %{http_code}]\n' -X POST "${aauth[@]}" \
               --data '{"operationKind":"select","targetPath":"/show/show-uuids"}' \
               "$ORIGIN/api/1/admin/data" | trunc
           fi

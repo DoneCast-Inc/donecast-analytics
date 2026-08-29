@@ -1,0 +1,98 @@
+name: Show server verify (read-only)
+# Confirms the show server can initialize after the podcastIndexCredentials
+# passthrough fix: waits for /info.json to report this commit's deploySha, then
+# re-runs the read-only admin probes that were returning HTTP 500 with
+# "'podcastIndexCredentials' is required to init ShowController".
+#
+# STRICTLY READ-ONLY. Every admin call uses operationKind "select", which the
+# worker only ever reads with. No update/delete/clear/rebuild/enqueue anywhere.
+on:
+  workflow_dispatch:
+  # The workflow_dispatch REST endpoint only resolves workflow files that exist
+  # on the default branch, so this branch-scoped push trigger is what actually
+  # lets the job run from here. Safe to drop once it lands on master.
+  push:
+    branches: [claude/slack-session-9d7l6b]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    env:
+      ADMIN_TOKENS: ${{ secrets.ADMIN_TOKENS }}
+      EXPECTED_SHA: ${{ github.sha }}
+    steps:
+      - name: Verify
+        run: |
+          set -u
+          ORIGIN=https://analytics.donecast.com
+
+          trunc() { head -c 4000; echo; }
+
+          # First comma-separated value only. Never echoed anywhere.
+          ADMIN_TOKEN=$(printf '%s' "${ADMIN_TOKENS:-}" | cut -d, -f1 | tr -d '[:space:]')
+          if [ -n "$ADMIN_TOKEN" ]; then
+            echo "::add-mask::$ADMIN_TOKEN"
+            echo "(admin token present: yes, length ${#ADMIN_TOKEN})"
+          else
+            echo "(admin token present: NO -- authenticated probes will be skipped)"
+          fi
+
+          echo "############################################################"
+          echo "### Waiting for deploySha == $EXPECTED_SHA"
+          echo "############################################################"
+          deployed=""
+          for i in $(seq 1 60); do
+            deployed=$(curl -sS "$ORIGIN/info.json" | jq -r '.deploySha // ""' 2>/dev/null)
+            echo "attempt $i: deploySha=${deployed:-<none>}"
+            [ "$deployed" = "$EXPECTED_SHA" ] && break
+            sleep 20
+          done
+          echo "--- GET /info.json ---"
+          curl -sS -w $'\n[http %{http_code}]\n' "$ORIGIN/info.json" | trunc
+          if [ "$deployed" = "$EXPECTED_SHA" ]; then
+            echo "DEPLOY SHA MATCH: yes"
+          else
+            echo "DEPLOY SHA MATCH: NO (deployed=${deployed:-<none>} expected=$EXPECTED_SHA) -- probing anyway"
+          fi
+
+          echo
+          echo "############################################################"
+          echo "### Read-only show-server admin probes"
+          echo "############################################################"
+          if [ -z "$ADMIN_TOKEN" ]; then
+            echo "(no admin token -- skipping authenticated probes)"
+            exit 0
+          fi
+
+          aauth=(-H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json")
+          fails=0
+
+          # POST /api/1/admin/data with operationKind "select" -- read-only in the worker code.
+          adm() {
+            local label="$1" payload="$2" out code
+            echo "--- ADMIN SELECT: $label"
+            echo "    body: $payload"
+            out=$(curl -sS -w $'\n[http %{http_code}]' -X POST "${aauth[@]}" \
+              --data "$payload" "$ORIGIN/api/1/admin/data")
+            printf '%s\n' "$out" | trunc
+            code=$(printf '%s' "$out" | tail -c 20 | grep -o '\[http [0-9]*\]' | grep -o '[0-9]*')
+            if [ "${code:-000}" = "200" ]; then
+              echo "RESULT $label -> 200 OK"
+            else
+              echo "RESULT $label -> ${code:-no-status} FAILED"
+              fails=$((fails + 1))
+            fi
+            echo
+          }
+
+          adm "/show/storage" '{"operationKind":"select","targetPath":"/show/storage","parameters":{"limit":"10"}}'
+          adm "/show/shows" '{"operationKind":"select","targetPath":"/show/shows","parameters":{"limit":"25"}}'
+
+          echo "############################################################"
+          echo "### SUMMARY: $fails probe(s) failed"
+          echo "############################################################"
+          [ "$fails" -eq 0 ] || exit 1
+          echo "=== DONE ==="

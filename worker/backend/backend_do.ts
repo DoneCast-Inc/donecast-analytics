@@ -124,9 +124,11 @@ export class BackendDO {
                         if (!this.showController) {
                             if (typeof origin !== 'string') throw new Error(`'origin' is required to init ShowController`);
                             if (!isValidOrigin(origin)) throw new Error(`Valid 'origin' is required to init ShowController: ${JSON.stringify(origin)}`);
-                            if (typeof podcastIndexCredentials !== 'string') throw new Error(`'podcastIndexCredentials' is required to init ShowController`);
-                            const podcastIndexClient = newPodcastIndexClient({ podcastIndexCredentials, origin });
-                            if (!podcastIndexClient) throw new Error(`Valid 'podcastIndexCredentials' are required to init ShowController`);
+                            // podcastIndexCredentials are only needed to call the external Podcast Index api (ShowController.work),
+                            // not to serve stored show/feed/stats data. Init without them so every show-server query doesn't 500
+                            // when the secret binding is missing or malformed; the lookups themselves throw if they're actually needed.
+                            const podcastIndexClient = typeof podcastIndexCredentials === 'string' ? newPodcastIndexClient({ podcastIndexCredentials, origin }) : undefined;
+                            if (!podcastIndexClient) consoleWarn('do-show-controller-pi', `ShowController: no valid 'podcastIndexCredentials', Podcast Index lookups will fail`);
                             if (blobsBucket === undefined) throw new Error(`'blobsBucket' is required to init ShowController`);
                             const feedBlobs = new R2BucketBlobs({ bucket: blobsBucket, prefix: 'feed/' });
                             const statsBlobs = new R2BucketBlobs({ bucket: blobsBucket, prefix: 'stats/' });

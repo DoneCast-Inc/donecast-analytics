@@ -1,7 +1,13 @@
 name: CF inventory (read-only)
 # Read-only reconnaissance: which Cloudflare accounts can CF_API_TOKEN reach,
 # and what OP3 storage lives in each. GET requests only.
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  # The workflow_dispatch REST endpoint only resolves workflow files that exist
+  # on the default branch, so this branch-scoped push trigger is what actually
+  # lets the job run from here. Safe to drop once it lands on master.
+  push:
+    branches: [claude/slack-session-9d7l6b]
 
 permissions:
   contents: read

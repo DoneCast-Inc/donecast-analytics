@@ -1,0 +1,160 @@
+name: Restore show registry (stage 1)
+# TEMPORARY. Authorized write operation.
+#
+# The show-server Durable Object registry was wiped on 2026-08-27. This workflow
+# re-creates the FeedRecord for Cinema IRL and re-binds it to its ORIGINAL show
+# uuid so the surviving stats in R2 become reachable again.
+#
+# Only two mutating calls are made:
+#   1. POST /api/1/notifications  (type=feeds) -> creates the FeedRecord
+#   2. POST /api/1/admin/data     action=set-show-uuid WITH an explicit
+#      show-uuid parameter (omitting it would mint a NEW random uuid and
+#      permanently orphan the show's history)
+# Everything else is a read-only select/GET. Nothing touches R2 or KV.
+#
+# Delete this workflow once the restore is verified.
+on:
+  push:
+    branches: [claude/slack-session-9d7l6b]
+
+permissions:
+  contents: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      ADMIN_TOKENS: ${{ secrets.ADMIN_TOKENS }}
+      ORIGIN: https://analytics.donecast.com
+      SHOW_UUID: a525e200d35543caa80ec4c4c65e29f4
+      FEED_URL: https://rss.donecast.com/rss/cinema-irl/feed.xml
+    steps:
+      - name: Stage 1 - restore Cinema IRL
+        run: |
+          set -u
+          ADMIN_TOKEN=$(printf '%s' "${ADMIN_TOKENS:-}" | cut -d, -f1 | tr -d '[:space:]')
+          if [ -z "$ADMIN_TOKEN" ]; then echo "no admin token"; exit 1; fi
+          echo "::add-mask::$ADMIN_TOKEN"
+
+          UA='donecast-restore/1.0'
+
+          # $1 = json body -> POST /api/1/admin/data
+          admin() {
+            curl -sS -A "$UA" --max-time 30 -w '\nHTTP %{http_code}\n' \
+              -X POST "$ORIGIN/api/1/admin/data" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data "$1"
+          }
+          # quiet variant: body only
+          adminq() {
+            curl -sS -A "$UA" --max-time 30 \
+              -X POST "$ORIGIN/api/1/admin/data" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data "$1"
+          }
+          get() {
+            curl -sS -A "$UA" --max-time 30 -w '\nHTTP %{http_code}\n' "$1"
+          }
+
+          echo '======================================================================'
+          echo '=== PRE-CHECK (read-only): does the show exist right now?'
+          echo '======================================================================'
+          get "$ORIGIN/api/1/shows/$SHOW_UUID?token=$ADMIN_TOKEN"
+          echo '--- select /show/feeds/<feedUrl> (before) ---'
+          admin "$(jq -nc --arg p "/show/feeds/$FEED_URL" '{operationKind:"select",targetPath:$p}')"
+
+          echo
+          echo '======================================================================'
+          echo '=== STEP 1: POST /api/1/notifications  (create FeedRecord)'
+          echo '======================================================================'
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+          BODY=$(jq -nc --arg now "$NOW" --arg f "$FEED_URL" \
+            '{type:"feeds",sent:$now,sender:"manual",feeds:[{feedUrl:$f}]}')
+          echo "body: $BODY"
+          curl -sS -A "$UA" --max-time 30 -w '\nHTTP %{http_code}\n' \
+            -X POST "$ORIGIN/api/1/notifications" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data "$BODY"
+
+          echo
+          echo '======================================================================'
+          echo '=== STEP 1b: poll for lastOkFetch + podcastGuid'
+          echo '======================================================================'
+          SEL=$(jq -nc --arg p "/show/feeds/$FEED_URL" '{operationKind:"select",targetPath:$p}')
+          READY=0
+          NUDGED=0
+          for i in $(seq 1 20); do
+            sleep 15
+            R=$(adminq "$SEL")
+            OK=$(printf '%s' "$R" | jq -r '.results[0].lastOkFetch // empty | if . == null then "" else "yes" end' 2>/dev/null)
+            PG=$(printf '%s' "$R" | jq -r '(.results[0].piFeed.podcastGuid // .results[0].podcastGuid) // empty' 2>/dev/null)
+            TITLE=$(printf '%s' "$R" | jq -r '.results[0].title // empty' 2>/dev/null)
+            echo "poll $i: lastOkFetch=${OK:-no} podcastGuid=${PG:-none} title=${TITLE:-none}"
+            if [ -n "$OK" ] && [ -n "$PG" ]; then READY=1; break; fi
+            if [ "$i" -ge 6 ] && [ "$NUDGED" -eq 0 ]; then
+              NUDGED=1
+              echo '--- nudging: update-feed-and-index-items ---'
+              admin "$(jq -nc --arg p "/show/feeds/$FEED_URL" \
+                '{operationKind:"update",targetPath:$p,parameters:{action:"update-feed-and-index-items"}}')"
+            fi
+          done
+
+          echo
+          echo '--- full feed record after polling ---'
+          adminq "$SEL" | jq .
+
+          if [ "$READY" -ne 1 ]; then
+            echo '!!! FEED NOT READY (missing lastOkFetch and/or podcastGuid) -- NOT binding uuid, stopping.'
+            exit 1
+          fi
+
+          echo
+          echo '======================================================================'
+          echo '=== STEP 2: bind ORIGINAL uuid (show-uuid passed EXPLICITLY)'
+          echo '======================================================================'
+          BIND=$(jq -nc --arg p "/show/feeds/$FEED_URL" --arg u "$SHOW_UUID" \
+            '{operationKind:"update",targetPath:$p,parameters:{action:"set-show-uuid","show-uuid":$u}}')
+          echo "body: $BIND"
+          admin "$BIND"
+
+          sleep 10
+
+          echo
+          echo '======================================================================'
+          echo '=== STEP 3 VERIFICATION (all read-only)'
+          echo '======================================================================'
+          echo '--- V1: select /show/shows (limit 50) ---'
+          admin '{"operationKind":"select","targetPath":"/show/shows","parameters":{"limit":"50"}}'
+
+          echo
+          echo "--- V2: GET /api/1/shows/$SHOW_UUID ---"
+          get "$ORIGIN/api/1/shows/$SHOW_UUID?token=$ADMIN_TOKEN"
+
+          echo
+          echo '--- V3: GET /api/1/queries/show-daily-downloads ---'
+          get "$ORIGIN/api/1/queries/show-daily-downloads?showUuid=$SHOW_UUID&token=$ADMIN_TOKEN"
+
+          echo
+          echo "--- V4: GET /api/1/shows/$SHOW_UUID/stats ---"
+          get "$ORIGIN/api/1/shows/$SHOW_UUID/stats?token=$ADMIN_TOKEN"
+
+          echo
+          echo "--- V5: GET /api/1/shows/$SHOW_UUID/summary-stats ---"
+          get "$ORIGIN/api/1/shows/$SHOW_UUID/summary-stats?token=$ADMIN_TOKEN"
+
+          echo
+          echo "--- V6a: select /show/shows/$SHOW_UUID ---"
+          admin "$(jq -nc --arg p "/show/shows/$SHOW_UUID" '{operationKind:"select",targetPath:$p}')"
+
+          echo
+          echo "--- V6b: select /show/shows/$SHOW_UUID/episodes (count + sample) ---"
+          EP=$(adminq "$(jq -nc --arg p "/show/shows/$SHOW_UUID/episodes" '{operationKind:"select",targetPath:$p}')")
+          echo "episode record count: $(printf '%s' "$EP" | jq -r '.results | length')"
+          printf '%s' "$EP" | jq -c '.results[0:5][]?'
+
+          echo
+          echo '=== STAGE 1 DONE ==='

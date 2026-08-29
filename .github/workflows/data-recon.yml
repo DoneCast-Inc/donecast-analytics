@@ -1,0 +1,222 @@
+name: Data recon (read-only)
+# Read-only reconnaissance: does the OP3 historical analytics data still exist in
+# the reachable Cloudflare account (R2 bucket analytics-blobs), and what does the
+# live instance report about its own stored state?
+#
+# STRICTLY READ-ONLY. Every Cloudflare REST call is a GET (plus one read-only
+# GraphQL analytics query). Every OP3 admin/data call uses operationKind
+# "select", which the worker code only ever reads with. No put/delete/restore/
+# backup-write/clear operations appear anywhere in this file.
+on:
+  workflow_dispatch:
+  # The workflow_dispatch REST endpoint only resolves workflow files that exist
+  # on the default branch, so this branch-scoped push trigger is what actually
+  # lets the job run from here. Safe to drop once it lands on master.
+  push:
+    branches: [claude/slack-session-9d7l6b]
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-22.04
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+      ADMIN_TOKENS: ${{ secrets.ADMIN_TOKENS }}
+    steps:
+      - name: Recon
+        run: |
+          set -u
+          API=https://api.cloudflare.com/client/v4
+          ORIGIN=https://analytics.donecast.com
+
+          # First comma-separated value only. Never echoed anywhere.
+          ADMIN_TOKEN=$(printf '%s' "${ADMIN_TOKENS:-}" | cut -d, -f1 | tr -d '[:space:]')
+          if [ -n "$ADMIN_TOKEN" ]; then
+            echo "::add-mask::$ADMIN_TOKEN"
+            echo "(admin token present: yes, length ${#ADMIN_TOKEN})"
+          else
+            echo "(admin token present: NO -- authenticated probes will be skipped)"
+          fi
+
+          cfauth=(-H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json")
+
+          trunc() { head -c 2000; echo; }
+
+          # GET against the Cloudflare API, printing status + body.
+          cfget() {
+            local url="$1"
+            local out
+            out=$(curl -sS -w $'\n[http %{http_code}]' "${cfauth[@]}" "$url" 2>&1)
+            printf '%s\n' "$out" | trunc
+          }
+
+          echo "############################################################"
+          echo "### SECTION 0 - context"
+          echo "############################################################"
+          echo "--- token verify ---"
+          curl -sS "${cfauth[@]}" "$API/user/tokens/verify" | jq -c '{success, status: .result.status, errors}' 2>/dev/null || echo "(unparseable)"
+          echo "--- R2 buckets in CF_ACCOUNT_ID ---"
+          curl -sS -w $'\n[http %{http_code}]\n' "${cfauth[@]}" "$API/accounts/$CF_ACCOUNT_ID/r2/buckets" | trunc
+
+          echo
+          echo "############################################################"
+          echo "### SECTION A - R2 object listing via REST (GET only)"
+          echo "############################################################"
+          for B in analytics-blobs analytics-blob; do
+            echo
+            echo "==================== BUCKET: $B ===================="
+
+            echo "--- bucket info: GET /r2/buckets/$B ---"
+            cfget "$API/accounts/$CF_ACCOUNT_ID/r2/buckets/$B"
+
+            echo "--- objects (no prefix): GET /r2/buckets/$B/objects?per_page=50 ---"
+            body=$(curl -sS "${cfauth[@]}" "$API/accounts/$CF_ACCOUNT_ID/r2/buckets/$B/objects?per_page=50" 2>&1)
+            code=$(curl -sS -o /dev/null -w '%{http_code}' "${cfauth[@]}" "$API/accounts/$CF_ACCOUNT_ID/r2/buckets/$B/objects?per_page=50" 2>&1)
+            echo "[http $code]"
+            n=$(printf '%s' "$body" | jq -r '(.result | if type=="array" then length elif type=="object" then (.objects|length) else 0 end) // 0' 2>/dev/null)
+            if [ -n "${n:-}" ] && [ "${n:-0}" != "0" ] && [ "${n:-null}" != "null" ]; then
+              echo "object count in this page: $n"
+              printf '%s' "$body" | jq -r '(.result // []) | (if type=="object" then .objects else . end) | .[]? | "KEY\t\(.key // .name)\tsize=\(.size // "?")\tuploaded=\(.uploaded // .last_modified // "?")"' 2>/dev/null | head -50
+              echo "--- truncated/cursor info ---"
+              printf '%s' "$body" | jq -c '{truncated: (.result_info.is_truncated // .result_info.truncated), cursor: (.result_info.cursor // null), per_page: (.result_info.per_page // null), count: (.result_info.count // null)}' 2>/dev/null
+            else
+              echo "no objects parsed; raw body follows:"
+              printf '%s\n' "$body" | trunc
+            fi
+
+            for P in "hits/" "stats/" "feed/" "backup/" "misc/" "assets/"; do
+              echo "--- prefix '$P' ---"
+              pbody=$(curl -sS "${cfauth[@]}" "$API/accounts/$CF_ACCOUNT_ID/r2/buckets/$B/objects?per_page=50&prefix=$P" 2>&1)
+              pcode=$(curl -sS -o /dev/null -w '%{http_code}' "${cfauth[@]}" "$API/accounts/$CF_ACCOUNT_ID/r2/buckets/$B/objects?per_page=50&prefix=$P" 2>&1)
+              pn=$(printf '%s' "$pbody" | jq -r '(.result | if type=="array" then length elif type=="object" then (.objects|length) else 0 end) // 0' 2>/dev/null)
+              echo "[http $pcode] parsed_count=${pn:-parse-failed}"
+              if [ -n "${pn:-}" ] && [ "${pn:-0}" != "0" ] && [ "${pn:-null}" != "null" ]; then
+                printf '%s' "$pbody" | jq -r '(.result // []) | (if type=="object" then .objects else . end) | .[]? | "KEY\t\(.key // .name)\tsize=\(.size // "?")"' 2>/dev/null | head -20
+              else
+                printf '%s\n' "$pbody" | head -c 600; echo
+              fi
+            done
+          done
+
+          echo
+          echo "############################################################"
+          echo "### SECTION A2 - R2 storage analytics (read-only GraphQL query)"
+          echo "############################################################"
+          # Read-only analytics: object count + payload size per bucket.
+          GQL_START=$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          GQL_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          GQL_QUERY="query { viewer { accounts(filter: {accountTag: \\\"$CF_ACCOUNT_ID\\\"}) { r2StorageAdaptiveGroups(limit: 50, filter: {datetime_geq: \\\"$GQL_START\\\", datetime_leq: \\\"$GQL_END\\\"}) { max { objectCount payloadSize metadataSize } dimensions { bucketName datetime } } } } }"
+          GQL="{\"query\":\"$GQL_QUERY\"}"
+          echo "window: $GQL_START .. $GQL_END"
+          curl -sS -w $'\n[http %{http_code}]\n' -X POST "${cfauth[@]}" \
+            --data "$GQL" https://api.cloudflare.com/client/v4/graphql | trunc
+
+          echo
+          echo "############################################################"
+          echo "### SECTION B - live OP3 read-only probes"
+          echo "############################################################"
+
+          echo "--- GET /info.json (no auth) ---"
+          curl -sS -w $'\n[http %{http_code}]\n' "$ORIGIN/info.json" | trunc
+
+          if [ -z "$ADMIN_TOKEN" ]; then
+            echo "(no admin token -- skipping authenticated probes)"
+          else
+            aauth=(-H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json")
+
+            # POST /api/1/admin/data with operationKind "select" -- read-only in the worker code.
+            adm() {
+              local label="$1"; shift
+              local payload="$1"; shift
+              echo "--- ADMIN SELECT: $label"
+              echo "    body: $payload"
+              curl -sS -w $'\n[http %{http_code}]\n' -X POST "${aauth[@]}" \
+                --data "$payload" "$ORIGIN/api/1/admin/data" | trunc
+              echo
+            }
+
+            adm "/registry (registered durable objects)" '{"operationKind":"select","targetPath":"/registry"}'
+            adm "/hits/state (hits server state + recent minute timestamps)" '{"operationKind":"select","targetPath":"/hits/state"}'
+            adm "/hits/attnums" '{"operationKind":"select","targetPath":"/hits/attnums"}'
+            adm "/crl/attnums" '{"operationKind":"select","targetPath":"/crl/attnums"}'
+            adm "/crl/sources" '{"operationKind":"select","targetPath":"/crl/sources","parameters":{"limit":"20"}}'
+            adm "/crl/records (newest 5 combined redirect log records)" '{"operationKind":"select","targetPath":"/crl/records","parameters":{"limit":"5","reverse":"true"}}'
+            adm "/crl/records/backup (in-memory backup job list)" '{"operationKind":"select","targetPath":"/crl/records/backup"}'
+            adm "/show/storage/backup (in-memory backup job list)" '{"operationKind":"select","targetPath":"/show/storage/backup"}'
+            adm "/show/shows (up to 25 show records)" '{"operationKind":"select","targetPath":"/show/shows","parameters":{"limit":"25"}}'
+            adm "/show/feeds (up to 10 feed records)" '{"operationKind":"select","targetPath":"/show/feeds","parameters":{"limit":"10"}}'
+            adm "/show/storage (first 10 raw show-server storage keys)" '{"operationKind":"select","targetPath":"/show/storage","parameters":{"limit":"10"}}'
+
+            echo "############################################################"
+            echo "### SECTION B2 - /api/1/hits (GET, reads R2 hits/ + backup/ directly)"
+            echo "############################################################"
+            for S in 2022-01-01 2023-01-01 2024-01-01 2025-01-01 2025-08-01; do
+              echo "--- GET /api/1/hits?start=$S&limit=5&format=json ---"
+              curl -sS -w $'\n[http %{http_code}]\n' "${aauth[@]}" \
+                "$ORIGIN/api/1/hits?start=$S&limit=5&format=json" | trunc
+              echo
+            done
+
+            echo "############################################################"
+            echo "### SECTION B3 - per-show download queries (GET, read stats/ in R2)"
+            echo "############################################################"
+            shows_json=$(curl -sS -X POST "${aauth[@]}" \
+              --data '{"operationKind":"select","targetPath":"/show/shows","parameters":{"limit":"5"}}' \
+              "$ORIGIN/api/1/admin/data" 2>&1)
+            uuids=$(printf '%s' "$shows_json" | jq -r '.results[]?.uuid' 2>/dev/null | head -3)
+            if [ -z "$uuids" ]; then
+              echo "(no show uuids available; skipping per-show queries)"
+            else
+              for U in $uuids; do
+                echo "--- show $U ---"
+                echo "  GET /api/1/queries/show-daily-downloads?showUuid=$U"
+                curl -sS -w $'\n[http %{http_code}]\n' "${aauth[@]}" \
+                  "$ORIGIN/api/1/queries/show-daily-downloads?showUuid=$U" | trunc
+                echo "  GET /api/1/queries/show-download-counts?showUuid=$U"
+                curl -sS -w $'\n[http %{http_code}]\n' "${aauth[@]}" \
+                  "$ORIGIN/api/1/queries/show-download-counts?showUuid=$U" | trunc
+                echo "  GET /api/1/downloads/show/$U?start=2023-01-01&limit=5"
+                curl -sS -w $'\n[http %{http_code}]\n' "${aauth[@]}" \
+                  "$ORIGIN/api/1/downloads/show/$U?start=2023-01-01&limit=5" | trunc
+                echo
+              done
+            fi
+
+            echo "--- GET /api/1/queries/recent-episodes-with-transcripts?limit=3 (reads misc/ in R2) ---"
+            curl -sS -w $'\n[http %{http_code}]\n' "${aauth[@]}" \
+              "$ORIGIN/api/1/queries/recent-episodes-with-transcripts?limit=3" | trunc
+          fi
+
+          echo
+          echo "############################################################"
+          echo "### SECTION C - SUMMARY"
+          echo "############################################################"
+          summarize_prefix() {
+            local B="$1" P="$2"
+            local body cnt
+            body=$(curl -sS "${cfauth[@]}" "$API/accounts/$CF_ACCOUNT_ID/r2/buckets/$B/objects?per_page=50&prefix=$P" 2>&1)
+            cnt=$(printf '%s' "$body" | jq -r '(.result | if type=="array" then length elif type=="object" then (.objects|length) else 0 end) // 0' 2>/dev/null)
+            if [ -z "${cnt:-}" ] || [ "${cnt:-null}" = "null" ]; then
+              local err
+              err=$(printf '%s' "$body" | jq -c '.errors' 2>/dev/null)
+              echo "SUMMARY  bucket=$B prefix=$P  -> LISTING FAILED  errors=${err:-<unparseable>}"
+            else
+              echo "SUMMARY  bucket=$B prefix=$P  -> $cnt object(s) in first page (per_page=50)"
+              printf '%s' "$body" | jq -r '(.result // []) | (if type=="object" then .objects else . end) | .[]? | "         sample: \(.key // .name)"' 2>/dev/null | head -3
+            fi
+          }
+          for B in analytics-blobs analytics-blob; do
+            for P in "" "hits/" "stats/" "feed/" "backup/" "misc/"; do
+              summarize_prefix "$B" "$P"
+            done
+          done
+          echo
+          echo "Reminder: the OP3 worker binds ONE R2 bucket (blobsBucket) and namespaces"
+          echo "everything by key prefix: hits/, stats/, misc/, assets/, backup/."
+          echo "Historical download hits live under hits/ ; rolled-up stats under stats/."
+
+          echo
+          echo "=== DONE ==="

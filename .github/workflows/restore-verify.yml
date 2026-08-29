@@ -1,0 +1,93 @@
+name: Restore verify (read-only)
+# TEMPORARY, STRICTLY READ-ONLY. Confirms the 18 restored shows resolve and
+# that their surviving daily-download history is reachable again.
+#
+# Every request here is a GET or an admin "select". There are no update or
+# delete operations and nothing touches R2, KV or any Durable Object.
+#
+# (The stage 2 run reported dailyRows=0 only because its jq read .rows/.results;
+# /api/1/queries/show-daily-downloads actually returns a dailyDownloads object.)
+#
+# Delete this workflow once the numbers have been captured.
+on:
+  push:
+    branches: [claude/slack-session-9d7l6b]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      ADMIN_TOKENS: ${{ secrets.ADMIN_TOKENS }}
+      ORIGIN: https://analytics.donecast.com
+    steps:
+      - name: Verify restored shows (read-only)
+        run: |
+          set -u
+          ADMIN_TOKEN=$(printf '%s' "${ADMIN_TOKENS:-}" | cut -d, -f1 | tr -d '[:space:]')
+          if [ -z "$ADMIN_TOKEN" ]; then echo "no admin token"; exit 1; fi
+          echo "::add-mask::$ADMIN_TOKEN"
+          UA='donecast-restore/1.0'
+
+          cat > /tmp/uuids.txt <<'EOF'
+          a525e200d35543caa80ec4c4c65e29f4
+          130f6d958b664c9f8702e94500385e1d
+          22bf4f16a51047889a1ec17fc242a89d
+          298ee9a52ac24c31beab60c5e24f452d
+          31814805bacc4db48f6bf3c4070d341f
+          323277debacf4700b10b088e845ca62a
+          4d505ff1b7564b40b747378804e24c7a
+          5b6e8fb6330347b3a6a9ae607ee24e9b
+          66c8f39415c04aed86c5fc751f39ca38
+          7830099bc82549f1b22a57945fe6148c
+          7838cf69ffaf4086b50d9112f099dea2
+          adebbec1820c47b3a49adb3e28d61a52
+          b1c53d222d2949bd9de0d657144af448
+          c4a6940c55a54c8e82aab23793c10a00
+          e44e72e7891a41a88aeb26ab8965f035
+          eede09ae67794bb4b378c9dde1925894
+          f192660267e547318f8a1b5dbd0880ee
+          f7f84828d2e64153982f5e797491edf9
+          EOF
+          sed -i 's/^ *//' /tmp/uuids.txt
+
+          printf '%-32s %-6s %-30s %-6s %-12s %-12s %-8s %s\n' \
+            UUID HTTP TITLE DAYS FIRSTDAY LASTDAY TOTAL EPISODES
+          while read -r U; do
+            [ -z "$U" ] && continue
+            S=$(curl -sS -A "$UA" --max-time 30 -o /tmp/s.json -w '%{http_code}' \
+              "$ORIGIN/api/1/shows/$U?token=$ADMIN_TOKEN")
+            T=$(jq -r '.title // "?"' /tmp/s.json 2>/dev/null)
+            D=$(curl -sS -A "$UA" --max-time 30 \
+              "$ORIGIN/api/1/queries/show-daily-downloads?showUuid=$U&token=$ADMIN_TOKEN")
+            N=$(printf '%s' "$D" | jq -r '(.dailyDownloads // {}) | length' 2>/dev/null)
+            F=$(printf '%s' "$D" | jq -r '(.dailyDownloads // {}) | keys | first // ""' 2>/dev/null)
+            L=$(printf '%s' "$D" | jq -r '(.dailyDownloads // {}) | keys | last // ""' 2>/dev/null)
+            TOT=$(printf '%s' "$D" | jq -r '[(.dailyDownloads // {}) | .[]] | add // 0' 2>/dev/null)
+            EP=$(curl -sS -A "$UA" --max-time 30 -X POST "$ORIGIN/api/1/admin/data" \
+              -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg p "/show/shows/$U/episodes" '{operationKind:"select",targetPath:$p}')" \
+              | jq -r '.results | length' 2>/dev/null)
+            printf '%-32s %-6s %-30.30s %-6s %-12s %-12s %-8s %s\n' \
+              "$U" "$S" "$T" "${N:-0}" "${F:-none}" "${L:-none}" "${TOT:-0}" "${EP:-?}"
+          done < /tmp/uuids.txt
+
+          echo
+          echo '--- summary-stats per show ---'
+          while read -r U; do
+            [ -z "$U" ] && continue
+            echo -n "$U  "
+            curl -sS -A "$UA" --max-time 30 "$ORIGIN/api/1/shows/$U/summary-stats?token=$ADMIN_TOKEN" | jq -c .
+          done < /tmp/uuids.txt
+
+          echo
+          echo '--- select /show/shows (limit 50): uuid / title ---'
+          curl -sS -A "$UA" --max-time 30 -X POST "$ORIGIN/api/1/admin/data" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+            --data '{"operationKind":"select","targetPath":"/show/shows","parameters":{"limit":"50"}}' \
+            | jq -r '.results[] | "\(.uuid)\t\(.title // "?")\t\(.podcastGuid // "?")"' | sort
+
+          echo '=== VERIFY DONE ==='

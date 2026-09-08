@@ -17,10 +17,16 @@ jobs:
   deploy-prod:
     runs-on: ubuntu-22.04
     env:
-      # A manual dispatch is always a forced deploy (blank DEPLOY_SHA skips
-      # deploy.sh's already-deployed early exit) — that's the whole point of
-      # dispatching: rebinding rotated secrets without a code change.
-      DEPLOY_SHA: ${{ github.event_name == 'workflow_dispatch' && '' || github.sha }}
+      # A manual dispatch is always a forced deploy — that's the whole point
+      # of dispatching: rebinding rotated secrets without a code change.
+      #
+      # It used to try `cond && '' || github.sha` to blank DEPLOY_SHA, but in
+      # GitHub expressions '' is falsy, so the || branch always won and every
+      # dispatch early-exited with "already deployed" (2026-09-08: a rotated
+      # admin token was never bound and the old one stayed live). A separate
+      # boolean is unambiguous.
+      DEPLOY_SHA: ${{ github.sha }}
+      FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3

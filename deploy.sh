@@ -14,8 +14,9 @@ DENO_VERSION="v1.46.3"
 DENOFLARE_VERSION="cebd786cf79a2f1c24736ac706a1b5f54b42949d"
 curl -fsSL https://deno.land/x/install/install.sh | DENO_INSTALL=./deno-$DENO_VERSION sh -s $DENO_VERSION
 
-# exit early if already deployed
-if [ -n "$DEPLOY_SHA" ]; then
+# exit early if already deployed — unless this is a forced (dispatch) deploy,
+# whose purpose is to rebind rotated secrets on an unchanged SHA
+if [ -n "$DEPLOY_SHA" ] && [ "${FORCE_DEPLOY:-false}" != "true" ]; then
   echo "DEPLOY_SHA: $DEPLOY_SHA"
   DEPLOYED_SHA=$(echo "try { console.log(JSON.parse(await (await fetch('https://$CF_CUSTOM_DOMAIN/info.json')).text()).deploySha) } catch {}" | ./deno-$DENO_VERSION/bin/deno run --allow-net -)
   if [ "$DEPLOY_SHA" = "$DEPLOYED_SHA" ]; then

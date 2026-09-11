@@ -1,19 +1,24 @@
-# Deploys the donecast.com wildcard-subdomain worker (cloudflare-workers/
-# podcast-proxy/worker.js in the main DoneCast repo). This workflow lives HERE
-# because this repo holds the only Workers-scope CF_API_TOKEN — the dev box has
-# no Workers credential (see DoneCast PR #1767). Manual dispatch only; the
-# script content is passed in as base64 so no cross-repo checkout is needed.
+# Deploys DoneCast Cloudflare Worker scripts from the main DoneCast repo
+# (cloudflare-workers/*). This workflow lives HERE because this repo holds the
+# only Workers-scope CF_API_TOKEN — the dev box has no Workers credential (see
+# DoneCast PR #1767). Manual dispatch only; the script content is passed in as
+# base64 so no cross-repo checkout is needed.
+#
+# Originally podcast-proxy-only; extended for dai-stitcher (DoneCast DAI edge
+# move): optional first-deploy of a NEW script (allow_new), custom metadata
+# (bindings) via metadata_b64, a per-script sanity marker, and a route-ensure
+# step (script PUTs preserve routes but never create them).
 name: Deploy podcast-proxy worker
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "list = show account worker scripts + current settings; deploy = upload script"
+        description: "list = show account worker scripts; deploy = upload script; inspect = show a script's versions + deployments; activate = deploy the script's newest version at 100%; expose/unexpose = toggle the script's workers.dev URL"
         required: true
         default: list
         type: choice
-        options: [list, deploy]
+        options: [list, deploy, inspect, activate, expose, unexpose]
       script_name:
         description: "Cloudflare worker script name (deploy mode)"
         required: false
@@ -22,6 +27,27 @@ on:
         description: "base64 of the ES-module worker.js (deploy mode)"
         required: false
         default: ""
+      allow_new:
+        description: "Allow creating a script that does not exist yet (first deploy)"
+        required: false
+        default: false
+        type: boolean
+      sanity_marker:
+        description: "String that must appear in the CURRENTLY deployed script before overwriting it (refuses to clobber an unrelated script)"
+        required: false
+        default: "subdomain"
+      metadata_b64:
+        description: "base64 of a custom metadata.json (bindings, compatibility_date, ...). Empty = the classic keep-everything metadata"
+        required: false
+        default: ""
+      route_pattern:
+        description: "If set (e.g. dai.donecast.com/*), ensure a workers route for this pattern -> script_name after deploy"
+        required: false
+        default: ""
+      route_zone:
+        description: "Zone name for route_pattern"
+        required: false
+        default: "donecast.com"
 
 permissions:
   contents: read
@@ -40,6 +66,47 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts" \
           | python3 -c "import json,sys; d=json.load(sys.stdin); print('success:', d['success'], d['errors']); [print(s['id'], ' modified=', s.get('modified_on')) for s in d.get('result') or []]"
 
+      - name: Inspect versions and deployments
+        if: ${{ inputs.mode == 'inspect' || inputs.mode == 'activate' || inputs.mode == 'deploy' }}
+        run: |
+          test -n "${{ inputs.script_name }}" || { echo "script_name is required"; exit 1; }
+          echo "--- versions (newest first) ---"
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/versions" > versions.json
+          python3 -c "import json; d=json.load(open('versions.json')); items=(d.get('result') or {}).get('items') or []; [print(v['id'], v.get('metadata', {}).get('created_on'), v.get('metadata', {}).get('source')) for v in items[:5]]; print('errors:', d.get('errors'))"
+          echo "--- deployments (newest first) ---"
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/deployments" > deployments.json
+          python3 -c "import json; d=json.load(open('deployments.json')); items=(d.get('result') or {}).get('deployments') or []; [print(x.get('id'), x.get('created_on'), [(v.get('version_id'), v.get('percentage')) for v in x.get('versions', [])]) for x in items[:5]]; print('errors:', d.get('errors'))"
+
+      - name: Activate newest version at 100%
+        if: ${{ inputs.mode == 'activate' }}
+        run: |
+          set -e
+          VID=$(python3 -c "import json; d=json.load(open('versions.json')); items=(d.get('result') or {}).get('items') or []; print(items[0]['id'] if items else '')")
+          test -n "$VID" || { echo "ABORT: no versions found"; exit 1; }
+          echo "activating version $VID"
+          python3 -c "import json; json.dump({'strategy': 'percentage', 'versions': [{'version_id': '$VID', 'percentage': 100}]}, open('deploy.json', 'w'))"
+          curl -s -X POST -H "Authorization: Bearer $CF_API_TOKEN" \
+            -H "Content-Type: application/json" -d @deploy.json \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/deployments" \
+          | python3 -c 'import json,sys; d=json.load(sys.stdin); print("deployment created:", d["success"], d["errors"])'
+
+      - name: Toggle workers.dev exposure
+        if: ${{ inputs.mode == 'expose' || inputs.mode == 'unexpose' }}
+        run: |
+          set -e
+          test -n "${{ inputs.script_name }}" || { echo "script_name is required"; exit 1; }
+          echo "--- account workers.dev subdomain ---"
+          curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/subdomain" \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print('subdomain:', (d.get('result') or {}).get('subdomain'), 'errors:', d['errors'])"
+          WANT=$([ "${{ inputs.mode }}" = "expose" ] && echo true || echo false)
+          curl -s -X POST -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"enabled\": $WANT}" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}/subdomain" \
+          | python3 -c "import json,sys; d=json.load(sys.stdin); print('workers.dev enabled set:', d.get('success'), d.get('errors'))"
+
       - name: Show current settings for script
         if: ${{ inputs.mode == 'deploy' }}
         run: |
@@ -49,18 +116,30 @@ jobs:
           echo
 
       - name: Backup current script and sanity-check target
+        id: backup
         if: ${{ inputs.mode == 'deploy' }}
         run: |
           set -e
-          curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}" > backup-${{ inputs.script_name }}.js
-          echo "--- current deployed content (first 30 lines) ---"
-          head -30 "backup-${{ inputs.script_name }}.js"
-          # refuse to overwrite a script that isn't the wildcard subdomain proxy
-          grep -q "subdomain" "backup-${{ inputs.script_name }}.js" || { echo "ABORT: target does not look like the subdomain proxy"; exit 1; }
+          status=$(curl -s -o "backup-${{ inputs.script_name }}.js" -w "%{http_code}" \
+            -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/${{ inputs.script_name }}")
+          if [ "$status" = "200" ]; then
+            echo "--- current deployed content (first 30 lines) ---"
+            head -30 "backup-${{ inputs.script_name }}.js"
+            # refuse to overwrite a script that doesn't carry the expected marker
+            grep -q "${{ inputs.sanity_marker }}" "backup-${{ inputs.script_name }}.js" \
+              || { echo "ABORT: target does not contain sanity marker '${{ inputs.sanity_marker }}'"; exit 1; }
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif [ "$status" = "404" ] && [ "${{ inputs.allow_new }}" = "true" ]; then
+            echo "Script does not exist yet — first deploy (allow_new)."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ABORT: GET script returned HTTP $status (allow_new=${{ inputs.allow_new }})"
+            exit 1
+          fi
 
       - name: Upload backup artifact
-        if: ${{ inputs.mode == 'deploy' }}
+        if: ${{ inputs.mode == 'deploy' && steps.backup.outputs.exists == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: pre-deploy-backup-${{ inputs.script_name }}
@@ -73,13 +152,19 @@ jobs:
           test -n "${{ inputs.script_b64 }}" || { echo "script_b64 is required"; exit 1; }
           echo "${{ inputs.script_b64 }}" | base64 -d > worker.js
           echo "--- uploading $(wc -c < worker.js) bytes ---"
-          # keep_bindings preserves any existing bindings/secrets; routes and
-          # custom domains are attached outside script content and survive PUTs.
-          cat > metadata.json <<'META'
+          if [ -n "${{ inputs.metadata_b64 }}" ]; then
+            echo "${{ inputs.metadata_b64 }}" | base64 -d > metadata.json
+            echo "--- custom metadata (binding values redacted) ---"
+            python3 -c "import json; m=json.load(open('metadata.json')); m2={k: v for k, v in m.items() if k != 'bindings'}; m2['bindings']=[{'type': b.get('type'), 'name': b.get('name')} for b in m.get('bindings', [])]; print(json.dumps(m2, indent=1))" || true
+          else
+            # keep_bindings preserves any existing bindings/secrets; routes and
+            # custom domains are attached outside script content and survive PUTs.
+            cat > metadata.json <<'META'
           {"main_module": "worker.js",
            "compatibility_date": "2024-01-01",
            "keep_bindings": ["secret_text", "plain_text", "kv_namespace", "r2_bucket", "d1", "durable_object_namespace", "queue", "analytics_engine", "service"]}
           META
+          fi
           curl -sf -X PUT \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -F "metadata=@metadata.json;type=application/json" \
@@ -107,3 +192,75 @@ jobs:
               open('deployed.js', 'wb').write(deployed)
               sys.exit(1)
           PY
+
+      - name: Ensure worker route
+        if: ${{ inputs.mode == 'deploy' && inputs.route_pattern != '' }}
+        run: |
+          set -e
+          # The token can see zones in more than one account (the pre-cutover
+          # personal copy of donecast.com still exists in "moved" status as
+          # the rollback) — only the ACTIVE zone serves traffic, so routes
+          # must land there. Also clean this pattern off any non-active
+          # same-name zone, where it would be inert-but-confusing.
+          curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones?name=${{ inputs.route_zone }}" > zones.json
+          python3 - <<'PY'
+          import json
+          zones = json.load(open("zones.json"))["result"] or []
+          for z in zones:
+              print(f"zone candidate: {z['id']} status={z['status']} account={z.get('account', {}).get('name')}")
+          active = [z["id"] for z in zones if z["status"] == "active"]
+          open("zone_id.txt", "w").write(active[0] if len(active) == 1 else "")
+          open("other_zones.txt", "w").write("\n".join(z["id"] for z in zones if z["status"] != "active"))
+          PY
+          ZONE_ID=$(cat zone_id.txt)
+          test -n "$ZONE_ID" || { echo "ABORT: no single ACTIVE zone named ${{ inputs.route_zone }} visible to this token"; exit 1; }
+          echo "zone id: $ZONE_ID"
+          while read -r OTHER; do
+            [ -n "$OTHER" ] || continue
+            curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/zones/$OTHER/workers/routes" > other_routes.json
+            RID=$(python3 -c "import json; rs=(json.load(open('other_routes.json')).get('result') or []); m=[r['id'] for r in rs if r['pattern']=='${{ inputs.route_pattern }}']; print(m[0] if m else '')")
+            if [ -n "$RID" ]; then
+              echo "removing stray route ${{ inputs.route_pattern }} from non-active zone $OTHER"
+              curl -s -X DELETE -H "Authorization: Bearer $CF_API_TOKEN" \
+                "https://api.cloudflare.com/client/v4/zones/$OTHER/workers/routes/$RID" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print("stray route removed:", d["success"], d["errors"])' || true
+            fi
+          done < other_zones.txt
+          curl -sf -H "Authorization: Bearer $CF_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/workers/routes" > routes.json
+          python3 - "$ZONE_ID" <<'PY' > route_action.txt
+          import json, sys
+          pattern = "${{ inputs.route_pattern }}"
+          script = "${{ inputs.script_name }}"
+          routes = json.load(open("routes.json"))["result"] or []
+          for r in routes:
+              if r["pattern"] == pattern:
+                  if r.get("script") == script:
+                      print("ok")
+                  else:
+                      print("update " + r["id"])
+                  break
+          else:
+              print("create")
+          PY
+          ACTION=$(cat route_action.txt)
+          echo "route action: $ACTION"
+          case "$ACTION" in
+            ok) echo "Route already attached." ;;
+            create)
+              curl -sf -X POST -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"pattern\": \"${{ inputs.route_pattern }}\", \"script\": \"${{ inputs.script_name }}\"}" \
+                "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/workers/routes" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print("route created:", d["success"], d["errors"])' ;;
+            update\ *)
+              ROUTE_ID=${ACTION#update }
+              curl -sf -X PUT -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"pattern\": \"${{ inputs.route_pattern }}\", \"script\": \"${{ inputs.script_name }}\"}" \
+                "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/workers/routes/$ROUTE_ID" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print("route updated:", d["success"], d["errors"])' ;;
+            *) echo "ABORT: unexpected route action '$ACTION'"; exit 1 ;;
+          esac

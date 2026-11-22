@@ -28,6 +28,7 @@ on:
 
 permissions:
   contents: read
+  actions: write   # keepalive step re-enables this workflow
 
 jobs:
   rollup:
@@ -100,3 +101,13 @@ jobs:
           echo "::endgroup::"
 
           echo "Rollup complete for ${DATE}"
+
+      # GitHub silently disables a scheduled workflow after 60 days with no
+      # commits to the repo. That happened 2026-11-07 and every DoneCast show
+      # read 0 downloads for two weeks (card #377). Re-enabling through the
+      # API on every run keeps the schedule alive without dummy commits.
+      - name: Keep schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/rollup.yml/enable"
